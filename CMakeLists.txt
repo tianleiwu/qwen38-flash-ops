@@ -52,4 +52,5 @@ function(qwen38_add_op_library NAME ARCH_SUFFIX)
 endfunction()
 
 qwen38_add_op_library(qwen_fused_attn_r5 a  src/fused_attn/fused_attn_r5.cu)        # domain qwen.fused_attn
+qwen38_add_op_library(qwen_fused_hc_r5  ""  src/fused_hc/fused_hc_r5.cu)            # domain qwen.fused_hc
 
