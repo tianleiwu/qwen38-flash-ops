@@ -53,4 +53,6 @@ endfunction()
 
 qwen38_add_op_library(qwen_fused_attn_r5 a  src/fused_attn/fused_attn_r5.cu)        # domain qwen.fused_attn
 qwen38_add_op_library(qwen_fused_hc_r5  ""  src/fused_hc/fused_hc_r5.cu)            # domain qwen.fused_hc
+qwen38_add_op_library(qwen_fused_gemm_r5 "" src/fused_gemm/fused_gemm.cu)           # domain qwen.fused_gemm
+target_include_directories(qwen_fused_gemm_r5 PRIVATE src/fused_gemm)
 
