@@ -63,3 +63,7 @@ if(QWEN38_BUILD_ORT_FORKS)
   add_subdirectory(forks)
 endif()
 
+if(QWEN38_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
