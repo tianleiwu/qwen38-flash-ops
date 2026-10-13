@@ -1,0 +1,18 @@
+# build outputs
+build/
+build*/
+*.so
+*.o
+*.a
+*.cubin
+*.fatbin
+*.ptx
+*.d
+__pycache__/
+*.pyc
+.ruff_cache/
+# model weights / data
+*.onnx
+*.onnx.data
+*.safetensors
+*.bin
