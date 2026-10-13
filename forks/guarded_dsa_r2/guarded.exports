@@ -1,0 +1,4 @@
+QWEN_GUARDED_1.0 {
+  global: RegisterCustomOps;
+  local: *;
+};

@@ -59,3 +59,7 @@ target_include_directories(qwen_fused_gemm_r5 PRIVATE src/fused_gemm)
 qwen38_add_op_library(qwen_fold         ""  src/fold/qwen_fold_ops.cu)              # domain qwen.fold
 qwen38_add_op_library(qwen_mtp_head     ""  src/mtp_head/qwen_mtp_ops.cu)           # domain qwen.mtp
 
+if(QWEN38_BUILD_ORT_FORKS)
+  add_subdirectory(forks)
+endif()
+
