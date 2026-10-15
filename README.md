@@ -13,11 +13,11 @@ onnxruntime-genai (no CUDA op matrix in its CI). Ops that are generic are meant 
 | --- | --- | --- | --- |
 | `libqwen_fused_attn_r5.so` | `qwen.fused_attn` | `GdnConvPrep`, `GdnProjPrep`, `GdnRecurrent`, `PleMidState`, `QkNormRope`, `QsaProjPrep`, `SigmoidGateMul` | `src/fused_attn` |
 | `libqwen_fused_hc_r5.so` | `qwen.fused_hc` | `HcBlock`, `HcPostBlock`, `HcDown`, `HcPostDown`, `HcUpPre`, `HcMixDown`, `HcMixPostDown`, `HcMixUp` | `src/fused_hc` |
-| `libqwen_fused_gemm_r5.so` | `qwen.fused_gemm` | `SkinnyGemm`, `SharedExpertDown`, `ArgmaxRows` | `src/fused_gemm` |
+| `libqwen_fused_gemm_r5.so` | `qwen.fused_gemm` | `SkinnyGemm`, `SharedExpertDown`, `ArgmaxRows`, `DequantWeightBf16`, `UntileHcBf16` | `src/fused_gemm` |
 | `libqwen_fused_ops.so` | `qwen.fused` | `DivSigmoidMul`, `SwishMul`, `SharedGateMulAdd` | `src/fused_ops` |
 | `libqwen_fold.so` | `qwen.fold` | `FoldMid`, `FoldMid2`, `FoldTail`, `EmbedNorm`, `RowSelectBf16x3` | `src/fold` |
 | `libqwen_mtp_head.so` | `qwen.mtp` | `MtpMoe`, `Bf16ArgMax` | `src/mtp_head` |
-| `libqwen_guarded_dsa_r2_v12.so` (fork, optional) | `qwen.static` | `GuardedDSA` | `forks/guarded_dsa_r2` |
+| `libqwen_guarded_dsa_r2_v12.so` (fork, optional) | `qwen.static` | `GuardedDSA` (BF16, INT8 and FP8 per-channel KV cache) | `forks/guarded_dsa_r2` |
 | `libqwen_packed_qsa_indexer_v11.so` (fork, optional) | `qwen.capture` | `PackedQSAIndexer` | `forks/packed_qsa_v11` |
 
 All ops run on the CUDA execution provider (`GetExecutionProviderType() == "CUDAExecutionProvider"`) and use the
@@ -57,9 +57,11 @@ Debug environment variables read by the library: `HC_PDL`, `HC_MERGE`, `HC_EARLY
 ### `qwen.fused_gemm` (`src/fused_gemm/`)
 | op | what it does |
 | --- | --- |
-| `SkinnyGemm` | BF16 decode GEMV/GEMM, M <= 4 rows; `x [...,K] @ W_i [K,N_i]` for g weights, writing each split slice directly to its own output (attributes `seg_outs`, `widths`, optional `trigger` for programmatic dependent launch). FP32 accumulation, fixed reduction order; row r of an M-row call is bit-identical to the M=1 result |
-| `SharedExpertDown` | `y = routed + bf16(bf16(swish_mul(g,u) @ W) * bf16(sigmoid(bf16(dot(gx, gw)))))` per row, M in [1,4] (6 inputs -> 1 output) |
+| `SkinnyGemm` | Decode GEMV/GEMM, M <= 4 rows; `x [...,K] @ W_i [K,N_i]` for g weights, writing each split slice directly to its own output (attributes `seg_outs`, `widths`, optional `trigger` for programmatic dependent launch, optional per-column `w_scale`). Supports BF16 `[K,N]`, FP8 E4M3FN `[K,N]`, and block-16 NVFP4 `UINT8 [K, N*9/16]` weights. FP32 accumulation, fixed reduction order; row r of an M-row call is bit-identical to the M=1 result |
+| `SharedExpertDown` | `y = routed + bf16(bf16(swish_mul(g,u) @ W) * bf16(sigmoid(bf16(dot(gx, gw)))))` per row, M in [1,4] (6 inputs -> 1 output); supports BF16, FP8 E4M3FN, and NVFP4 `W` (optional `w_scale` attribute) |
 | `ArgmaxRows` | `idx[...] = argmax over the last axis` of BF16/FP16/FP32 logits (numpy semantics: lowest index on ties, first NaN wins); optional 2nd output: the maximum as FP32 |
+| `DequantWeightBf16` | Dequantizes an FP8 E4M3FN `[K,N]` or block-16 NVFP4 `UINT8 [K, N*9/16]` weight tensor (with `n_cols` and `w_scale` attributes, plus optional second input `x` to tie buffer lifetime to the consuming `MatMul`) into `[K,N]` BF16 |
+| `UntileHcBf16` | Losslessly untiles `[160, 20480]` pre-tiled hyper-connection weights (`hc_tiled.data`) into `[10240, 320]` (`kind=0`) or `[320, 10240]` (`kind=1`) BF16 so the dense prefill graph can share `hc_tiled.data` with the decode graph |
 
 ### `qwen.fused` (`src/fused_ops/fused_ops.cu`)
 Pointwise BF16 fusions: `DivSigmoidMul` (`y = bf16(bf16(sigmoid(bf16(x / div))) * mul)`), `SwishMul` (`y = bf16(bf16(silu(g)) * u)`),
@@ -77,10 +79,10 @@ These encode the control-block ABI of the GenAI `qwen38_flash_graph` engine (`ct
 
 ### `qwen.mtp` (`src/mtp_head/qwen_mtp_ops.cu`)
 * `Bf16ArgMax(logits bf16[..., V]) -> idx int64[..., 1], scratch f32[rows,124,2]`: greedy draft token on the device (lowest index among maxima); specialised for V = 248320.
-* `MtpMoe(premix bf16[1,R,2560], router_logits bf16[1,R,512], gate_up bf16[512,1280,2560], down bf16[512,2560,640]) -> routed bf16[1,R,2560], scratch f32`: softmax, top-10, normalised weights, gate_up GEMV + SwishMul, down GEMV and the weighted sum of the MTP head MoE in one op (replaces the expert-weight Gather of the exported graph).
+* `MtpMoe(premix bf16[1,R,2560], router_logits bf16[1,R,512], gate_up, down) -> routed bf16[1,R,2560], scratch f32`: softmax, top-10, normalised weights, gate_up GEMV + SwishMul, down GEMV and the weighted sum of the MTP head MoE in one op (replaces the expert-weight Gather of the exported graph). Supports BF16 (`[512,1280,2560]` / `[512,2560,640]`), per-row FP8 E4M3FN (`UINT8 [512,1280,2576]` / `[512,2560,656]`), and block-16 NVFP4 (`UINT8 [512,1280,1440]` / `[512,2560,360]`, attributes `gate_up_global_scale` and `down_global_scale`).
 
 ### Forks of ORT kernels (`forks/`, optional)
-`GuardedDSA` (guarded dynamic sparse attention with the 2-row chain, domain `qwen.static`) and `PackedQSAIndexer` (packed QSA
+`GuardedDSA` (guarded dynamic sparse attention with the 2-row chain and BF16 / per-channel INT8 / per-channel FP8 E4M3FN KV cache support via `k_scale` and `v_scale` attributes, domain `qwen.static`) and `PackedQSAIndexer` (packed QSA
 indexer, domain `qwen.capture`) are forks of ORT CUDA kernels and need ORT private headers: see `forks/README.md`.
 
 ## Build

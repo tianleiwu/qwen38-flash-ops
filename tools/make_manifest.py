@@ -31,7 +31,7 @@ LIBRARIES = {
     ),
     "libqwen_fused_gemm_r5.so": (
         "qwen.fused_gemm",
-        ["SkinnyGemm", "SharedExpertDown", "ArgmaxRows"],
+        ["SkinnyGemm", "SharedExpertDown", "ArgmaxRows", "DequantWeightBf16", "UntileHcBf16"],
         ["src/fused_gemm/fused_gemm.cu", "src/fused_gemm/skinny_gemm.cuh", "src/fused_gemm/argmax_rows.cuh", "src/common/sigmoid_acc.cuh"],
     ),
     "libqwen_fold.so": ("qwen.fold", ["FoldMid", "FoldMid2", "FoldTail", "EmbedNorm", "RowSelectBf16x3"], ["src/fold/qwen_fold_ops.cu"]),

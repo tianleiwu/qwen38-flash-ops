@@ -9,7 +9,7 @@ against a matching ORT source + build tree, and only with `-DQWEN38_BUILD_ORT_FO
 
 | library | domain / op | sources | forked from |
 | --- | --- | --- | --- |
-| `libqwen_guarded_dsa_r2_v12.so` | `qwen.static` / `GuardedDSA` | `guarded_dsa_r2/` | `contrib_ops/cuda/bert/dynamic_sparse_attention_impl.cu` (guarded dynamic sparse attention with a 2-row chain; the "fold" patch replaces a memset node by `ZeroFlagsKernel`) |
+| `libqwen_guarded_dsa_r2_v12.so` | `qwen.static` / `GuardedDSA` | `guarded_dsa_r2/` | `contrib_ops/cuda/bert/dynamic_sparse_attention_impl.cu` (guarded dynamic sparse attention with a 2-row chain, `ZeroFlagsKernel` patch, and BF16 / per-channel INT8 / per-channel FP8 E4M3FN KV cache support via `k_scale` and `v_scale` attributes) |
 | `libqwen_packed_qsa_indexer_v11.so` | `qwen.capture` / `PackedQSAIndexer` | `packed_qsa_v11/` | `contrib_ops/cuda/sparse/packed_sparse_attention_indexer_{impl.cu,impl.h,common.h}`, `sparse_attention_indexer_{common.h,device_math.cuh}` (built with `-DPACKED_QSA_EXACT_FLOAT_STATE`) |
 
 ## ORT commits they fork from

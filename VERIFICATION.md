@@ -18,4 +18,10 @@ Reference: the nine libraries of the Engine v12b model package (`libs/`).
    all token hashes, counts and cycle statistics equal to the run with the original libraries. A 128-token decode smoke
    (fast prefill) generates the expected answer at 251 tokens/s (original package: 234-251 tokens/s).
 
+5. **Engine v12c quantized extensions** (`pkg_v12b_engine_int8kv_fp8w_fp4moe`):
+   - `qwen.fused_gemm`: `SkinnyGemm` and `SharedExpertDown` extended with software-pipelined per-column `FLOAT8E4M3FN` and block-16 `NVFP4` weight modes (`w_scale` attribute); added `DequantWeightBf16` and `UntileHcBf16` ops for zero-copy weight sharing between `dense/model.onnx` and `target/model.onnx`.
+   - `qwen.mtp`: `MtpMoe` extended with software-pipelined per-row `FP8 E4M3FN` and block-16 `NVFP4` modes (`gate_up_global_scale` / `down_global_scale` attributes).
+   - `qwen.static` (`GuardedDSA`): extended with per-channel `INT8` and `FLOAT8E4M3FN` KV cache support (`k_scale` / `v_scale` attributes).
+   - Verified on `pkg_v12b_engine_int8kv_fp8w_fp4moe`: 6/6 Engine gate prompts pass (`64/64` tokens, decode `7.660 / 7.840 / 8.036 ms/cycle`), MMLU-Pro 800 achieves `667/800 (83.375%)`, and peak GPU memory is reduced by `12.47 GiB` (`116,123 -> 103,353 MiB`).
+
 `manifest.json` holds the SHA256 of every library of this build (`sha256`), of the shipped libraries (`shipped_reference_sha256`) and of all sources.

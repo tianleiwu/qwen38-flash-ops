@@ -10,6 +10,7 @@
 
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include "common/sigmoid_acc.cuh"
@@ -46,6 +47,9 @@ struct Params {
   int K;
   int nseg;
   const bf16* w[kMaxSeg];
+  const uint8_t* w_q[kMaxSeg];
+  const float* w_scale[kMaxSeg];
+  int w_mode[kMaxSeg];  // 0 = BF16, 1 = FP8 E4M3 [K, N], 2 = NVFP4 block-16 [K, N * 9 / 16]
   int n[kMaxSeg];
   int tile_begin[kMaxSeg + 1];  // first CTA tile (blockIdx.x) of each segment
   int out_begin[kMaxSeg + 1];   // first output of each segment
@@ -87,15 +91,69 @@ __device__ __forceinline__ uint4 LoadWeights(const bf16* p) {
   return v;
 }
 
-__device__ __forceinline__ uint2 LoadWeights4(const bf16* p) {
+__device__ __forceinline__ uint2 LoadWeights4(const void* p) {
   uint2 v;
   asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
+  return v;
+}
+
+__device__ __forceinline__ uint32_t LoadWeightsU32(const void* p) {
+  uint32_t v;
+  asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(v) : "l"(p));
   return v;
 }
 
 __device__ __forceinline__ void FmaWord(float (&acc)[8], int base, uint32_t word, float xv) {
   acc[base] = fmaf(__uint_as_float(word << 16), xv, acc[base]);
   acc[base + 1] = fmaf(__uint_as_float(word & 0xffff0000u), xv, acc[base + 1]);
+}
+
+__device__ __forceinline__ uint32_t Fp8x2ToBf16x2Bits(uint16_t fp8x2) {
+  const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(fp8x2), __NV_E4M3);
+  const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+  const __nv_bfloat162 b = __floats2bfloat162_rn(f.x, f.y);
+  return *reinterpret_cast<const uint32_t*>(&b);
+}
+
+// Every finite E4M3FN value is 100% bit-exact in BFloat16.
+__device__ __forceinline__ uint4 UnpackFp8U2ToBf16U4(const uint2& h) {
+  uint4 out;
+  out.x = Fp8x2ToBf16x2Bits(static_cast<uint16_t>(h.x & 0xffffu));
+  out.y = Fp8x2ToBf16x2Bits(static_cast<uint16_t>(h.x >> 16));
+  out.z = Fp8x2ToBf16x2Bits(static_cast<uint16_t>(h.y & 0xffffu));
+  out.w = Fp8x2ToBf16x2Bits(static_cast<uint16_t>(h.y >> 16));
+  return out;
+}
+
+__device__ __forceinline__ uint4 LoadWeightsFp8AsBf16(const uint8_t* p) {
+  return UnpackFp8U2ToBf16U4(LoadWeights4(p));
+}
+
+__device__ __forceinline__ float E2M1ToFloat(uint32_t nib) {
+  const uint32_t m = nib & 7u;
+  const uint32_t exp_mant = (m == 0u) ? 0u : ((m == 1u ? 252u : (m + 252u)) << 22);
+  return __uint_as_float(((nib & 8u) << 28) | exp_mant);
+}
+
+// Every product of E2M1 and E4M3FN has <= 6 significand bits and exponent in [-10, 10], so it is 100% bit-exact in BFloat16.
+__device__ __forceinline__ uint4 UnpackFp4ToBf16U4(uint32_t pack8, uint8_t s_fp8) {
+  const __half_raw hr = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(s_fp8), __NV_E4M3);
+  const float s = __half2float(*reinterpret_cast<const __half*>(&hr));
+  uint32_t words[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float f0 = E2M1ToFloat((pack8 >> (8 * i)) & 0xfu) * s;
+    const float f1 = E2M1ToFloat((pack8 >> (8 * i + 4)) & 0xfu) * s;
+    const __nv_bfloat162 b = __floats2bfloat162_rn(f0, f1);
+    words[i] = *reinterpret_cast<const uint32_t*>(&b);
+  }
+  return make_uint4(words[0], words[1], words[2], words[3]);
+}
+
+__device__ __forceinline__ uint4 LoadWeightsFp4AsBf16(const uint8_t* row_p, int N, int col) {
+  const uint32_t pack8 = LoadWeightsU32(row_p + (col >> 1));
+  const uint8_t s_fp8 = row_p[(N >> 1) + (col >> 4)];
+  return UnpackFp4ToBf16U4(pack8, s_fp8);
 }
 
 __device__ __forceinline__ void Store(const Params& p, int seg, int m, int n, float v) {
@@ -120,6 +178,7 @@ __device__ __forceinline__ float GateOf(const float* gate, int m) {
 // NARROW: a 4-column segment; every thread is a K lane loading 8 bytes per row.
 template <bool FUSE>
 __device__ __forceinline__ void StoreOut(const Params& p, int seg, int m, int n, float v, float gate) {
+  if (p.w_scale[seg] != nullptr) v *= p.w_scale[seg][n];
   if constexpr (FUSE) {
     const float shared = Round(Round(v) * gate);
     const size_t o = static_cast<size_t>(m) * p.n[seg] + n;
@@ -160,14 +219,36 @@ __device__ __forceinline__ void GemvBody(const Params& p, int seg, int tile) {
     for (int i = 0; i < 8; ++i) acc[m][i] = 0.f;
 
   const bf16* wp0 = w + col;
+  const int w_mode = p.w_mode[seg];
+  const uint8_t* wq = p.w_q[seg];
+  const size_t fp4_row_bytes = static_cast<size_t>(N) * 9 / 16;
   uint4 vpre[FUSE ? U : 1];
+  uint2 vpre_fp8[FUSE ? U : 1];
+  uint32_t vpre_fp4[FUSE ? U : 1];
+  uint8_t vpre_fp4_s[FUSE ? U : 1];
   static_assert(!FUSE || M * kFuseMaxK * 4 <= 16 * 1024, "fused xs buffer");
   if constexpr (FUSE) {
     // First weight loads go out before the prologue below so their latency overlaps it.
+    if (w_mode == 0) {
 #pragma unroll
-    for (int u = 0; u < U; ++u) {
-      const int kk = kbeg + lane_k + u * LANES;
-      vpre[u] = (valid && kk < kend) ? LoadWeights(wp0 + static_cast<size_t>(kk) * N) : make_uint4(0, 0, 0, 0);
+      for (int u = 0; u < U; ++u) {
+        const int kk = kbeg + lane_k + u * LANES;
+        vpre[u] = (valid && kk < kend) ? LoadWeights(wp0 + static_cast<size_t>(kk) * N) : make_uint4(0, 0, 0, 0);
+      }
+    } else if (w_mode == 1) {
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        const int kk = kbeg + lane_k + u * LANES;
+        vpre_fp8[u] = (valid && kk < kend) ? LoadWeights4(wq + static_cast<size_t>(kk) * N + col) : make_uint2(0, 0);
+      }
+    } else {
+#pragma unroll
+      for (int u = 0; u < U; ++u) {
+        const int kk = kbeg + lane_k + u * LANES;
+        const uint8_t* row_p = wq + static_cast<size_t>(kk) * fp4_row_bytes;
+        vpre_fp4[u] = (valid && kk < kend) ? LoadWeightsU32(row_p + (col >> 1)) : 0u;
+        vpre_fp4_s[u] = (valid && kk < kend) ? row_p[(N >> 1) + (col >> 4)] : 0u;
+      }
     }
     // x = swish_mul(g, u) for this CTA's K slice, and the gate-logit partial sums.
     // rows are interleaved in the loops (independent per-row chains, same arithmetic as the M == 1 kernel)
@@ -199,55 +280,138 @@ __device__ __forceinline__ void GemvBody(const Params& p, int seg, int tile) {
     __syncthreads();
   }
   if (valid) {
-#ifdef SKINNY_TILED
-    const bf16* wp = w + static_cast<size_t>(tile) * p.K * NCOL + tx * 8;
-    const size_t row_stride = NCOL;
-#else
     const bf16* wp = w + col;
     const size_t row_stride = N;
-#endif
-    for (int k = kbeg + lane_k; k < kend; k += LANES * U) {
-      uint4 v[U];
-      float xv[U][M];
+    if (NARROW || w_mode == 0) {
+      for (int k = kbeg + lane_k; k < kend; k += LANES * U) {
+        uint4 v[U];
+        float xv[U][M];
 #pragma unroll
-      for (int u = 0; u < U; ++u) {
-        const int kk = k + u * LANES;
-        v[u] = make_uint4(0, 0, 0, 0);
+        for (int u = 0; u < U; ++u) {
+          const int kk = k + u * LANES;
+          v[u] = make_uint4(0, 0, 0, 0);
 #pragma unroll
-        for (int m = 0; m < M; ++m) xv[u][m] = 0.f;
-        if (FUSE && k == kbeg + lane_k) {
-          v[u] = vpre[FUSE ? u : 0];
-          if (kk < kend) {
+          for (int m = 0; m < M; ++m) xv[u][m] = 0.f;
+          if (FUSE && k == kbeg + lane_k) {
+            v[u] = vpre[FUSE ? u : 0];
+            if (kk < kend) {
 #pragma unroll
-            for (int m = 0; m < M; ++m) xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+              for (int m = 0; m < M; ++m) xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+            }
+          } else if (kk < kend) {
+            if constexpr (NARROW) {
+              const uint2 h = LoadWeights4(wp + static_cast<size_t>(kk) * row_stride);
+              v[u].x = h.x;
+              v[u].y = h.y;
+            } else {
+              v[u] = LoadWeights(wp + static_cast<size_t>(kk) * row_stride);
+            }
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+              if constexpr (FUSE) {
+                xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+              } else {
+                xv[u][m] = __bfloat162float(p.x[static_cast<size_t>(m) * p.K + kk]);
+              }
+            }
           }
-        } else if (kk < kend) {
-          if constexpr (NARROW) {
-            const uint2 h = LoadWeights4(wp + static_cast<size_t>(kk) * row_stride);
-            v[u].x = h.x;
-            v[u].y = h.y;
-          } else {
-            v[u] = LoadWeights(wp + static_cast<size_t>(kk) * row_stride);
-          }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
 #pragma unroll
           for (int m = 0; m < M; ++m) {
-            if constexpr (FUSE) {
-              xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
-            } else {
-              xv[u][m] = __bfloat162float(p.x[static_cast<size_t>(m) * p.K + kk]);
+            FmaWord(acc[m], 0, v[u].x, xv[u][m]);
+            FmaWord(acc[m], 2, v[u].y, xv[u][m]);
+            if constexpr (!NARROW) {
+              FmaWord(acc[m], 4, v[u].z, xv[u][m]);
+              FmaWord(acc[m], 6, v[u].w, xv[u][m]);
             }
           }
         }
       }
+    } else if (w_mode == 1) {
+      const uint8_t* wp_fp8 = wq + col;
+      for (int k = kbeg + lane_k; k < kend; k += LANES * U) {
+        uint2 raw[U];
+        float xv[U][M];
 #pragma unroll
-      for (int u = 0; u < U; ++u) {
+        for (int u = 0; u < U; ++u) {
+          const int kk = k + u * LANES;
+          raw[u] = make_uint2(0, 0);
 #pragma unroll
-        for (int m = 0; m < M; ++m) {
-          FmaWord(acc[m], 0, v[u].x, xv[u][m]);
-          FmaWord(acc[m], 2, v[u].y, xv[u][m]);
-          if constexpr (!NARROW) {
-            FmaWord(acc[m], 4, v[u].z, xv[u][m]);
-            FmaWord(acc[m], 6, v[u].w, xv[u][m]);
+          for (int m = 0; m < M; ++m) xv[u][m] = 0.f;
+          if (FUSE && k == kbeg + lane_k) {
+            raw[u] = vpre_fp8[FUSE ? u : 0];
+            if (kk < kend) {
+#pragma unroll
+              for (int m = 0; m < M; ++m) xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+            }
+          } else if (kk < kend) {
+            raw[u] = LoadWeights4(wp_fp8 + static_cast<size_t>(kk) * row_stride);
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+              if constexpr (FUSE) {
+                xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+              } else {
+                xv[u][m] = __bfloat162float(p.x[static_cast<size_t>(m) * p.K + kk]);
+              }
+            }
+          }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          const uint4 v = UnpackFp8U2ToBf16U4(raw[u]);
+#pragma unroll
+          for (int m = 0; m < M; ++m) {
+            FmaWord(acc[m], 0, v.x, xv[u][m]);
+            FmaWord(acc[m], 2, v.y, xv[u][m]);
+            FmaWord(acc[m], 4, v.z, xv[u][m]);
+            FmaWord(acc[m], 6, v.w, xv[u][m]);
+          }
+        }
+      }
+    } else {
+      for (int k = kbeg + lane_k; k < kend; k += LANES * U) {
+        uint32_t raw_p[U];
+        uint8_t raw_s[U];
+        float xv[U][M];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          const int kk = k + u * LANES;
+          raw_p[u] = 0u;
+          raw_s[u] = 0u;
+#pragma unroll
+          for (int m = 0; m < M; ++m) xv[u][m] = 0.f;
+          if (FUSE && k == kbeg + lane_k) {
+            raw_p[u] = vpre_fp4[FUSE ? u : 0];
+            raw_s[u] = vpre_fp4_s[FUSE ? u : 0];
+            if (kk < kend) {
+#pragma unroll
+              for (int m = 0; m < M; ++m) xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+            }
+          } else if (kk < kend) {
+            const uint8_t* row_p = wq + static_cast<size_t>(kk) * fp4_row_bytes;
+            raw_p[u] = LoadWeightsU32(row_p + (col >> 1));
+            raw_s[u] = row_p[(N >> 1) + (col >> 4)];
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+              if constexpr (FUSE) {
+                xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+              } else {
+                xv[u][m] = __bfloat162float(p.x[static_cast<size_t>(m) * p.K + kk]);
+              }
+            }
+          }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+          const uint4 v = UnpackFp4ToBf16U4(raw_p[u], raw_s[u]);
+#pragma unroll
+          for (int m = 0; m < M; ++m) {
+            FmaWord(acc[m], 0, v.x, xv[u][m]);
+            FmaWord(acc[m], 2, v.y, xv[u][m]);
+            FmaWord(acc[m], 4, v.z, xv[u][m]);
+            FmaWord(acc[m], 6, v.w, xv[u][m]);
           }
         }
       }
@@ -425,8 +589,6 @@ inline cudaError_t LaunchRows(int m, const Params& p, const Config& cfg, cudaStr
     case 1: return DispatchThreads<1>(p, cfg, s);
 #ifndef SKINNY_M1_ONLY
     case 2: return DispatchThreads<2>(p, cfg, s);
-    case 3: return DispatchThreads<3>(p, cfg, s);
-    case 4: return DispatchThreads<4>(p, cfg, s);
 #endif
     default: return cudaErrorInvalidValue;
   }
@@ -441,7 +603,7 @@ inline cudaError_t Launch(int m, const Params& p, const Config& cfg, cudaStream_
   if (m < 1) return cudaErrorInvalidValue;
   int done = 0;
   while (done < m) {
-    int chunk = std::min(m - done, 4);
+    int chunk = std::min(m - done, 2);
     while (chunk > 1 && !RowsFit(chunk, cfg)) --chunk;
     Params q = p;
     q.x = p.x + static_cast<size_t>(done) * p.K;
@@ -481,8 +643,6 @@ inline cudaError_t LaunchFused(int m, const Params& p, const Config& cfg, cudaSt
     case 1: return FusedRows<1>(p, cfg, s);
 #ifndef SKINNY_M1_ONLY
     case 2: return FusedRows<2>(p, cfg, s);
-    case 3: return FusedRows<3>(p, cfg, s);
-    case 4: return FusedRows<4>(p, cfg, s);
 #endif
     default: return cudaErrorInvalidValue;
   }

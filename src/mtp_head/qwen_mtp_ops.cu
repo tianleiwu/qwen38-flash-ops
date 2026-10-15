@@ -14,6 +14,7 @@
 #include "onnxruntime_cxx_api.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -63,6 +64,40 @@ __device__ __forceinline__ void Unpack(const uint4& v, float* f) {
   for (int i = 0; i < 4; ++i) {
     f[2 * i] = __uint_as_float(w[i] << 16);
     f[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
+  }
+}
+
+__device__ __forceinline__ void UnpackFp8(const uint2& v, float* f) {
+  const uint32_t w[2] = {v.x, v.y};
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const __half2_raw hr01 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(w[i] & 0xffffu), __NV_E4M3);
+    const __half2_raw hr23 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(w[i] >> 16), __NV_E4M3);
+    const float2 f01 = __half22float2(*reinterpret_cast<const __half2*>(&hr01));
+    const float2 f23 = __half22float2(*reinterpret_cast<const __half2*>(&hr23));
+    f[4 * i + 0] = f01.x;
+    f[4 * i + 1] = f01.y;
+    f[4 * i + 2] = f23.x;
+    f[4 * i + 3] = f23.y;
+  }
+}
+
+__device__ __forceinline__ float Fp8ByteToFloat(uint8_t b) {
+  const __half_raw hr = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(b), __NV_E4M3);
+  return __half2float(*reinterpret_cast<const __half*>(&hr));
+}
+
+__device__ __forceinline__ float E2M1ToFloat(uint32_t nib) {
+  const uint32_t m = nib & 7u;
+  const uint32_t exp_mant = (m == 0u) ? 0u : ((m == 1u ? 252u : (m + 252u)) << 22);
+  return __uint_as_float(((nib & 8u) << 28) | exp_mant);
+}
+
+__device__ __forceinline__ void UnpackFp4(uint32_t pack8, uint8_t scale_fp8, float* f) {
+  const float s = Fp8ByteToFloat(scale_fp8);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    f[i] = E2M1ToFloat((pack8 >> (4 * i)) & 0xfu) * s;
   }
 }
 
@@ -275,6 +310,89 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32)
   }
 }
 
+// Quantized GateUpKernel: mode == 1 (FP8 E4M3 rows of 2560 + 16 trailer with float32 scale),
+// mode == 2 (NVFP4 block-16 rows of 1280 + 160 = 1440 bytes with global_scale).
+template <int MODE>
+__global__ void __launch_bounds__(kWarpsPerBlock * 32)
+    GateUpQuantKernel(const bf16* __restrict__ x, const uint8_t* __restrict__ gate_up, float* __restrict__ scratch,
+                      float global_scale) {
+  constexpr int kRowBytes = MODE == 1 ? (kHidden + 16) : (kHidden * 9 / 16);
+  const int row = blockIdx.z;
+  const int slot = blockIdx.y;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  float* base = scratch + static_cast<int64_t>(row) * kScratchStride;
+  const int expert = __float_as_int(base[slot]);
+  const int j = blockIdx.x * kWarpsPerBlock + warp;
+  const uint4* xv = reinterpret_cast<const uint4*>(x + static_cast<int64_t>(row) * kHidden);
+  const uint8_t* rg = gate_up + (static_cast<int64_t>(expert) * kGateUp + j) * kRowBytes;
+  const uint8_t* ru = gate_up + (static_cast<int64_t>(expert) * kGateUp + kFfn + j) * kRowBytes;
+  uint4 xr[kPerLane];
+  float acc_g = 0.0f, acc_u = 0.0f;
+  if constexpr (MODE == 1) {
+    uint2 g2[kPerLane], u2[kPerLane];
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+      const int c = i * 32 + lane;
+      g2[i] = __ldg(reinterpret_cast<const uint2*>(rg) + c);
+      u2[i] = __ldg(reinterpret_cast<const uint2*>(ru) + c);
+      xr[i] = __ldg(xv + c);
+    }
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+      float fg[8], fu[8], fx[8];
+      UnpackFp8(g2[i], fg);
+      UnpackFp8(u2[i], fu);
+      Unpack(xr[i], fx);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        acc_g = fmaf(fg[k], fx[k], acc_g);
+        acc_u = fmaf(fu[k], fx[k], acc_u);
+      }
+    }
+  } else {
+    uint32_t g4[kPerLane], u4[kPerLane];
+    uint8_t gs[kPerLane], us[kPerLane];
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+      const int c = i * 32 + lane;
+      g4[i] = __ldg(reinterpret_cast<const uint32_t*>(rg) + c);
+      u4[i] = __ldg(reinterpret_cast<const uint32_t*>(ru) + c);
+      gs[i] = __ldg(rg + (kHidden / 2) + (c >> 1));
+      us[i] = __ldg(ru + (kHidden / 2) + (c >> 1));
+      xr[i] = __ldg(xv + c);
+    }
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+      float fg[8], fu[8], fx[8];
+      UnpackFp4(g4[i], gs[i], fg);
+      UnpackFp4(u4[i], us[i], fu);
+      Unpack(xr[i], fx);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        acc_g = fmaf(fg[k], fx[k], acc_g);
+        acc_u = fmaf(fu[k], fx[k], acc_u);
+      }
+    }
+  }
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc_g += __shfl_xor_sync(0xffffffffu, acc_g, offset);
+    acc_u += __shfl_xor_sync(0xffffffffu, acc_u, offset);
+  }
+  if (lane == 0) {
+    if constexpr (MODE == 1) {
+      acc_g *= *reinterpret_cast<const float*>(rg + kHidden);
+      acc_u *= *reinterpret_cast<const float*>(ru + kHidden);
+    } else {
+      acc_g *= global_scale;
+      acc_u *= global_scale;
+    }
+    const float gv = R(acc_g);
+    const float uv = R(acc_u);
+    const float s = R(gv * Sigmoid(gv));
+    reinterpret_cast<bf16*>(base + 32)[slot * kFfn + j] = __float2bfloat16(s * uv);
+  }
+}
+
 // down GEMV + weighted bf16 sum. grid (2560, rows), block = 10 warps: warp k owns expert slot k of output element
 // blockIdx.x (one round trip of weight loads per block); the 10 weighted products are summed in expert order.
 constexpr int kDownChunks = kFfn / kChunk;             // 80
@@ -320,6 +438,80 @@ __global__ void __launch_bounds__(kTopK * 32)
   }
 }
 
+template <int MODE>
+__global__ void __launch_bounds__(kTopK * 32)
+    DownQuantKernel(const uint8_t* __restrict__ down, const float* __restrict__ scratch, bf16* __restrict__ out,
+                    float global_scale) {
+  constexpr int kRowBytes = MODE == 1 ? (kFfn + 16) : (kFfn * 9 / 16);
+  const int row = blockIdx.y;
+  const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int i = blockIdx.x;
+  const float* base = scratch + static_cast<int64_t>(row) * kScratchStride;
+  const int expert = __float_as_int(base[k]);
+  const uint8_t* rw = down + (static_cast<int64_t>(expert) * kHidden + i) * kRowBytes;
+  const uint4* h = reinterpret_cast<const uint4*>(reinterpret_cast<const bf16*>(base + 32) + k * kFfn);
+  float sum = 0.0f;
+  uint4 hv[kDownPerLane];
+  if constexpr (MODE == 1) {
+    uint2 w2[kDownPerLane];
+#pragma unroll
+    for (int t = 0; t < kDownPerLane; ++t) {
+      const int c = t * 32 + lane;
+      w2[t] = c < kDownChunks ? __ldg(reinterpret_cast<const uint2*>(rw) + c) : make_uint2(0, 0);
+      hv[t] = c < kDownChunks ? h[c] : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int t = 0; t < kDownPerLane; ++t) {
+      const int c = t * 32 + lane;
+      if (c < kDownChunks) {
+        float fw[8], fh[8];
+        UnpackFp8(w2[t], fw);
+        Unpack(hv[t], fh);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) sum = fmaf(fw[e], fh[e], sum);
+      }
+    }
+  } else {
+    uint32_t w4[kDownPerLane];
+    uint8_t ws[kDownPerLane];
+#pragma unroll
+    for (int t = 0; t < kDownPerLane; ++t) {
+      const int c = t * 32 + lane;
+      w4[t] = c < kDownChunks ? __ldg(reinterpret_cast<const uint32_t*>(rw) + c) : 0u;
+      ws[t] = c < kDownChunks ? __ldg(rw + (kFfn / 2) + (c >> 1)) : 0u;
+      hv[t] = c < kDownChunks ? h[c] : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int t = 0; t < kDownPerLane; ++t) {
+      const int c = t * 32 + lane;
+      if (c < kDownChunks) {
+        float fw[8], fh[8];
+        UnpackFp4(w4[t], ws[t], fw);
+        Unpack(hv[t], fh);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) sum = fmaf(fw[e], fh[e], sum);
+      }
+    }
+  }
+  for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+  __shared__ float weighted[kTopK];
+  if (lane == 0) {
+    if constexpr (MODE == 1) {
+      sum *= *reinterpret_cast<const float*>(rw + kFfn);
+    } else {
+      sum *= global_scale;
+    }
+    weighted[k] = R(R(sum) * base[kTopK + k]);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+#pragma unroll
+    for (int e = 0; e < kTopK; ++e) total += weighted[e];
+    out[static_cast<int64_t>(row) * kHidden + i] = __float2bfloat16(total);
+  }
+}
+
 struct ArgMaxState {
   const OrtApi& api;
   ArgMaxState(const OrtApi& a, const OrtKernelInfo*) : api(a) {}
@@ -351,7 +543,21 @@ struct ArgMaxState {
 
 struct MoeState {
   const OrtApi& api;
-  MoeState(const OrtApi& a, const OrtKernelInfo*) : api(a) {}
+  float gate_up_global_scale = 1.0f;
+  float down_global_scale = 1.0f;
+
+  MoeState(const OrtApi& a, const OrtKernelInfo* info) : api(a) {
+    Ort::ConstKernelInfo k(info);
+    try {
+      gate_up_global_scale = k.GetAttribute<float>("gate_up_global_scale");
+    } catch (const std::exception&) {
+    }
+    try {
+      down_global_scale = k.GetAttribute<float>("down_global_scale");
+    } catch (const std::exception&) {
+    }
+  }
+
   OrtStatus* ComputeV2(OrtKernelContext* raw) noexcept {
     try {
       Ort::KernelContext c(raw);
@@ -361,9 +567,13 @@ struct MoeState {
       auto down = c.GetInput(3);
       auto shape = x.GetTensorTypeAndShapeInfo().GetShape();
       const int64_t rows = Count(x) / kHidden;
-      if (Count(x) != rows * kHidden || Count(router) != rows * kExperts ||
-          Count(gate_up) != static_cast<int64_t>(kExperts) * kGateUp * kHidden ||
-          Count(down) != static_cast<int64_t>(kExperts) * kHidden * kFfn) {
+      const auto gu_info = gate_up.GetTensorTypeAndShapeInfo();
+      const auto dn_info = down.GetTensorTypeAndShapeInfo();
+      const auto gu_shape = gu_info.GetShape();
+      const auto dn_shape = dn_info.GetShape();
+      if (Count(x) != rows * kHidden || Count(router) != rows * kExperts || gu_shape.size() != 3 ||
+          dn_shape.size() != 3 || gu_shape[0] != kExperts || gu_shape[1] != kGateUp || dn_shape[0] != kExperts ||
+          dn_shape[1] != kHidden) {
         throw std::invalid_argument("MtpMoe: shape mismatch");
       }
       auto out = c.GetOutput(0, shape);
@@ -373,12 +583,33 @@ struct MoeState {
       float* scratch_ptr = scratch.GetTensorMutableData<float>();
       RouterKernel<<<static_cast<unsigned>(rows), 32, 0, stream>>>(
           reinterpret_cast<const bf16*>(router.GetTensorData<Ort::BFloat16_t>()), scratch_ptr);
-      GateUpKernel<<<dim3(kFfn / kWarpsPerBlock, kTopK, static_cast<unsigned>(rows)), kWarpsPerBlock * 32, 0, stream>>>(
-          reinterpret_cast<const bf16*>(x.GetTensorData<Ort::BFloat16_t>()),
-          reinterpret_cast<const bf16*>(gate_up.GetTensorData<Ort::BFloat16_t>()), scratch_ptr);
-      DownKernel<<<dim3(kHidden, static_cast<unsigned>(rows)), kTopK * 32, 0, stream>>>(
-          reinterpret_cast<const bf16*>(down.GetTensorData<Ort::BFloat16_t>()), scratch_ptr,
-          reinterpret_cast<bf16*>(out.GetTensorMutableData<Ort::BFloat16_t>()));
+      const auto wtype = gu_info.GetElementType();
+      if (wtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 && gu_shape[2] == kHidden && dn_shape[2] == kFfn) {
+        GateUpKernel<<<dim3(kFfn / kWarpsPerBlock, kTopK, static_cast<unsigned>(rows)), kWarpsPerBlock * 32, 0, stream>>>(
+            reinterpret_cast<const bf16*>(x.GetTensorData<Ort::BFloat16_t>()),
+            reinterpret_cast<const bf16*>(gate_up.GetTensorData<Ort::BFloat16_t>()), scratch_ptr);
+        DownKernel<<<dim3(kHidden, static_cast<unsigned>(rows)), kTopK * 32, 0, stream>>>(
+            reinterpret_cast<const bf16*>(down.GetTensorData<Ort::BFloat16_t>()), scratch_ptr,
+            reinterpret_cast<bf16*>(out.GetTensorMutableData<Ort::BFloat16_t>()));
+      } else if (wtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 && gu_shape[2] == kHidden + 16 &&
+                 dn_shape[2] == kFfn + 16) {
+        GateUpQuantKernel<1><<<dim3(kFfn / kWarpsPerBlock, kTopK, static_cast<unsigned>(rows)), kWarpsPerBlock * 32, 0, stream>>>(
+            reinterpret_cast<const bf16*>(x.GetTensorData<Ort::BFloat16_t>()),
+            static_cast<const uint8_t*>(gate_up.GetTensorRawData()), scratch_ptr, 1.0f);
+        DownQuantKernel<1><<<dim3(kHidden, static_cast<unsigned>(rows)), kTopK * 32, 0, stream>>>(
+            static_cast<const uint8_t*>(down.GetTensorRawData()), scratch_ptr,
+            reinterpret_cast<bf16*>(out.GetTensorMutableData<Ort::BFloat16_t>()), 1.0f);
+      } else if (wtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 && gu_shape[2] == (kHidden * 9) / 16 &&
+                 dn_shape[2] == (kFfn * 9) / 16) {
+        GateUpQuantKernel<2><<<dim3(kFfn / kWarpsPerBlock, kTopK, static_cast<unsigned>(rows)), kWarpsPerBlock * 32, 0, stream>>>(
+            reinterpret_cast<const bf16*>(x.GetTensorData<Ort::BFloat16_t>()),
+            static_cast<const uint8_t*>(gate_up.GetTensorRawData()), scratch_ptr, gate_up_global_scale);
+        DownQuantKernel<2><<<dim3(kHidden, static_cast<unsigned>(rows)), kTopK * 32, 0, stream>>>(
+            static_cast<const uint8_t*>(down.GetTensorRawData()), scratch_ptr,
+            reinterpret_cast<bf16*>(out.GetTensorMutableData<Ort::BFloat16_t>()), down_global_scale);
+      } else {
+        throw std::invalid_argument("MtpMoe: unsupported expert weight layout");
+      }
       CheckLaunch();
       return nullptr;
     } catch (const std::exception& e) {
@@ -390,6 +621,7 @@ struct MoeState {
 constexpr auto kBF = ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
 constexpr auto kF32 = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
 constexpr auto kI64 = ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
+constexpr auto kAny = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
 
 template <typename Derived, typename State>
 struct MtpOp : Ort::CustomOpBase<Derived, State, true> {
@@ -414,7 +646,7 @@ struct ArgMaxOp : MtpOp<ArgMaxOp, ArgMaxState> {
   const char* GetName() const { return "Bf16ArgMax"; }
 };
 struct MoeOp : MtpOp<MoeOp, MoeState> {
-  static constexpr std::array<ONNXTensorElementDataType, 4> kIn = {kBF, kBF, kBF, kBF};
+  static constexpr std::array<ONNXTensorElementDataType, 4> kIn = {kBF, kBF, kAny, kAny};
   static constexpr std::array<ONNXTensorElementDataType, 2> kOut = {kBF, kF32};
   const char* GetName() const { return "MtpMoe"; }
 };

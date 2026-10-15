@@ -5,6 +5,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -40,6 +41,36 @@ __device__ __forceinline__ float ToFloat(T value) {
 template <typename T>
 __device__ __forceinline__ T FromFloat(float value) {
   return static_cast<T>(value);
+}
+
+__device__ __forceinline__ float Fp8E4M3ToFloat(uint8_t b) {
+  const __half_raw hr = __nv_cvt_fp8_to_halfraw(b, __NV_E4M3);
+  return __half2float(*reinterpret_cast<const __half*>(&hr));
+}
+
+__device__ __forceinline__ uint8_t FloatToFp8E4M3(float v) {
+  const float clamped = fmaxf(-448.0f, fminf(448.0f, v));
+  return static_cast<uint8_t>(__nv_cvt_float_to_fp8(clamped, __NV_SATFINITE, __NV_E4M3));
+}
+
+__device__ __forceinline__ uint8_t FloatToInt8Byte(float v) {
+  const int q = __float2int_rn(v);
+  return static_cast<uint8_t>(static_cast<int8_t>(max(-128, min(127, q))));
+}
+
+__device__ __forceinline__ float QuantByteToFloat(uint8_t b, int kv_quant_mode) {
+  return kv_quant_mode == 1 ? static_cast<float>(static_cast<int8_t>(b)) : Fp8E4M3ToFloat(b);
+}
+
+template <typename T>
+__device__ __forceinline__ uint4 UnpackKv8ToT8(uint2 packed, int kv_quant_mode) {
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&packed);
+  T out[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    out[i] = FromFloat<T>(QuantByteToFloat(bytes[i], kv_quant_mode));
+  }
+  return *reinterpret_cast<const uint4*>(out);
 }
 
 __device__ __forceinline__ uint32_t PackMmaHalf2(half low, half high) {
@@ -352,7 +383,12 @@ __global__ void AppendKvKernel(const T* query,
                                bool is_packed,
                                float epsilon,
                                const int32_t* validation_error,
-                               int error_stride) {
+                               int error_stride,
+                               uint8_t* present_key_q = nullptr,
+                               uint8_t* present_value_q = nullptr,
+                               const float* k_scale = nullptr,
+                               const float* v_scale = nullptr,
+                               int kv_quant_mode = 0) {
   const int block = static_cast<int>(blockIdx.x);
   if (block >= block_count) {
     return;
@@ -419,8 +455,18 @@ __global__ void AppendKvKernel(const T* query,
          destination_sequence) *
             head_size +
         h;
-    present_key[cache_offset] = result;
-    present_value[cache_offset] = (is_packed ? query : value)[value_offset];
+    const T val = (is_packed ? query : value)[value_offset];
+    if (kv_quant_mode == 0) {
+      present_key[cache_offset] = result;
+      present_value[cache_offset] = val;
+    } else {
+      const float ks = k_scale[static_cast<int64_t>(kv_head) * head_size + h];
+      const float vs = v_scale[static_cast<int64_t>(kv_head) * head_size + h];
+      const float kf = ToFloat(result) / ks;
+      const float vf = ToFloat(val) / vs;
+      present_key_q[cache_offset] = kv_quant_mode == 1 ? FloatToInt8Byte(kf) : FloatToFp8E4M3(kf);
+      present_value_q[cache_offset] = kv_quant_mode == 1 ? FloatToInt8Byte(vf) : FloatToFp8E4M3(vf);
+    }
   }
 }
 
@@ -644,7 +690,12 @@ __global__ void GroupedPrefillDynamicSparseAttentionKernel(
     bool local_plus_selected,
     bool selected_from_auxiliary,
     bool use_smooth_softmax,
-    const int32_t* validation_error) {
+    const int32_t* validation_error,
+    const uint8_t* main_key_q = nullptr,
+    const uint8_t* main_value_q = nullptr,
+    const float* k_scale = nullptr,
+    const float* v_scale = nullptr,
+    int kv_quant_mode = 0) {
   if (validation_error != nullptr && *validation_error != 0) return;
   const int block = static_cast<int>(blockIdx.x);
   if (block >= block_count) {
@@ -711,9 +762,13 @@ __global__ void GroupedPrefillDynamicSparseAttentionKernel(
 #endif
       if (active_head) {
     const T* query_head = query + (static_cast<int64_t>(row) * num_heads + head) * head_size;
+    const float* ks_head = (kv_quant_mode != 0 && k_scale != nullptr)
+                               ? k_scale + static_cast<int64_t>(kv_head) * head_size
+                               : nullptr;
 #pragma unroll
     for (int i = 0; i < kValuesPerLane; ++i) {
-      query_values[i] = ToFloat(query_head[lane + i * 32]);
+      const float qv = ToFloat(query_head[lane + i * 32]);
+      query_values[i] = ks_head != nullptr ? qv * ks_head[lane + i * 32] : qv;
     }
   }
 
@@ -769,16 +824,25 @@ __global__ void GroupedPrefillDynamicSparseAttentionKernel(
             ((static_cast<int64_t>(b) * kv_num_heads + kv_head) * source_length +
              candidate_index) *
             head_size;
-        const T* key_head = candidate_is_auxiliary
-                                ? auxiliary_key + offset
-                                : main_key + offset;
-        const T* value_head = candidate_is_auxiliary
-                                  ? auxiliary_value + offset
-                                  : main_value + offset;
-        reinterpret_cast<uint4*>(shared_key + shared_offset)[load_lane] =
-            reinterpret_cast<const uint4*>(key_head)[load_lane];
-        reinterpret_cast<uint4*>(shared_value + shared_offset)[load_lane] =
-            reinterpret_cast<const uint4*>(value_head)[load_lane];
+        if (kv_quant_mode == 0 || candidate_is_auxiliary) {
+          const T* key_head = candidate_is_auxiliary
+                                  ? auxiliary_key + offset
+                                  : main_key + offset;
+          const T* value_head = candidate_is_auxiliary
+                                    ? auxiliary_value + offset
+                                    : main_value + offset;
+          reinterpret_cast<uint4*>(shared_key + shared_offset)[load_lane] =
+              reinterpret_cast<const uint4*>(key_head)[load_lane];
+          reinterpret_cast<uint4*>(shared_value + shared_offset)[load_lane] =
+              reinterpret_cast<const uint4*>(value_head)[load_lane];
+        } else {
+          const uint8_t* key_head_q = main_key_q + offset;
+          const uint8_t* value_head_q = main_value_q + offset;
+          reinterpret_cast<uint4*>(shared_key + shared_offset)[load_lane] =
+              UnpackKv8ToT8<T>(reinterpret_cast<const uint2*>(key_head_q)[load_lane], kv_quant_mode);
+          reinterpret_cast<uint4*>(shared_value + shared_offset)[load_lane] =
+              UnpackKv8ToT8<T>(reinterpret_cast<const uint2*>(value_head_q)[load_lane], kv_quant_mode);
+        }
       }
     }
     __syncthreads();
@@ -857,11 +921,15 @@ __global__ void GroupedPrefillDynamicSparseAttentionKernel(
 
   if (active_head) {
     T* output_head = output + (static_cast<int64_t>(row) * num_heads + head) * head_size;
+    const float* vs_head = (kv_quant_mode != 0 && v_scale != nullptr)
+                               ? v_scale + static_cast<int64_t>(kv_head) * head_size
+                               : nullptr;
 #pragma unroll
     for (int i = 0; i < kValuesPerLane; ++i) {
+      const float acc = vs_head != nullptr ? accumulator[i] * vs_head[lane + i * 32] : accumulator[i];
       output_head[lane + i * 32] = running_sum == 0.0f
                                        ? FromFloat<T>(0.0f)
-                                       : FromFloat<T>(accumulator[i] / running_sum);
+                                       : FromFloat<T>(acc / running_sum);
     }
   }
 }
@@ -895,7 +963,12 @@ __global__ void GroupedDecodeDynamicSparseAttentionKernel(
     bool use_smooth_softmax,
     const int32_t* validation_error,
     int error_stride,
-    int rows_per_batch) {
+    int rows_per_batch,
+    const uint8_t* main_key_q = nullptr,
+    const uint8_t* main_value_q = nullptr,
+    const float* k_scale = nullptr,
+    const float* v_scale = nullptr,
+    int kv_quant_mode = 0) {
   const int block = static_cast<int>(blockIdx.x);
   if (block >= grouped_block_count) {
     return;
@@ -967,9 +1040,13 @@ __global__ void GroupedDecodeDynamicSparseAttentionKernel(
 #endif
       if (active_head) {
     const T* query_head = query + (static_cast<int64_t>(b) * num_heads + head) * head_size;
+    const float* ks_head = (kv_quant_mode != 0 && k_scale != nullptr)
+                               ? k_scale + static_cast<int64_t>(kv_head) * head_size
+                               : nullptr;
 #pragma unroll
     for (int i = 0; i < kValuesPerLane; ++i) {
-      query_values[i] = ToFloat(query_head[lane + i * 32]);
+      const float qv = ToFloat(query_head[lane + i * 32]);
+      query_values[i] = ks_head != nullptr ? qv * ks_head[lane + i * 32] : qv;
     }
   }
 
@@ -1056,16 +1133,25 @@ __global__ void GroupedDecodeDynamicSparseAttentionKernel(
             ((static_cast<int64_t>(cache_b) * kv_num_heads + kv_head) * source_length +
              candidate_index) *
             head_size;
-        const T* key_head = candidate_is_auxiliary
-                                ? auxiliary_key + offset
-                                : main_key + offset;
-        const T* value_head = candidate_is_auxiliary
-                                  ? auxiliary_value + offset
-                                  : main_value + offset;
-        reinterpret_cast<uint4*>(shared_key + shared_offset)[load_lane] =
-            reinterpret_cast<const uint4*>(key_head)[load_lane];
-        reinterpret_cast<uint4*>(shared_value + shared_offset)[load_lane] =
-            reinterpret_cast<const uint4*>(value_head)[load_lane];
+        if (kv_quant_mode == 0 || candidate_is_auxiliary) {
+          const T* key_head = candidate_is_auxiliary
+                                  ? auxiliary_key + offset
+                                  : main_key + offset;
+          const T* value_head = candidate_is_auxiliary
+                                    ? auxiliary_value + offset
+                                    : main_value + offset;
+          reinterpret_cast<uint4*>(shared_key + shared_offset)[load_lane] =
+              reinterpret_cast<const uint4*>(key_head)[load_lane];
+          reinterpret_cast<uint4*>(shared_value + shared_offset)[load_lane] =
+              reinterpret_cast<const uint4*>(value_head)[load_lane];
+        } else {
+          const uint8_t* key_head_q = main_key_q + offset;
+          const uint8_t* value_head_q = main_value_q + offset;
+          reinterpret_cast<uint4*>(shared_key + shared_offset)[load_lane] =
+              UnpackKv8ToT8<T>(reinterpret_cast<const uint2*>(key_head_q)[load_lane], kv_quant_mode);
+          reinterpret_cast<uint4*>(shared_value + shared_offset)[load_lane] =
+              UnpackKv8ToT8<T>(reinterpret_cast<const uint2*>(value_head_q)[load_lane], kv_quant_mode);
+        }
       }
     }
     __syncthreads();
@@ -1151,9 +1237,13 @@ __global__ void GroupedDecodeDynamicSparseAttentionKernel(
       partial_max[partial_block] = running_max;
       partial_sum[partial_block] = running_sum;
     }
+    const float* vs_head = (kv_quant_mode != 0 && v_scale != nullptr)
+                               ? v_scale + static_cast<int64_t>(kv_head) * head_size
+                               : nullptr;
 #pragma unroll
     for (int i = 0; i < kValuesPerLane; ++i) {
-      partial_output[static_cast<int64_t>(partial_block) * head_size + lane + i * 32] = accumulator[i];
+      const float acc = vs_head != nullptr ? accumulator[i] * vs_head[lane + i * 32] : accumulator[i];
+      partial_output[static_cast<int64_t>(partial_block) * head_size + lane + i * 32] = acc;
     }
   }
 }
@@ -1790,25 +1880,43 @@ Status LaunchDynamicSparseAttention(
       static_cast<int64_t>(parameters.batch_size) * parameters.kv_num_heads *
       parameters.cache_capacity * parameters.head_size;
   const size_t cache_bytes =
-      SafeInt<size_t>(cache_elements) * sizeof(T);
+      SafeInt<size_t>(cache_elements) * (data.kv_quant_mode == 0 ? sizeof(T) : sizeof(uint8_t));
   ORT_RETURN_IF_NOT(
-      data.past_key == nullptr ||
+      (data.past_key == nullptr && data.past_key_q == nullptr) ||
           parameters.past_cache_capacity == parameters.cache_capacity,
       "DynamicSparseAttention: past and present cache capacities must match.");
   if (initialize_key_cache) {
-    if (data.past_key == nullptr) {
-      CUDA_RETURN_IF_ERROR(cudaMemsetAsync(data.present_key, 0, cache_bytes, stream));
+    if (data.kv_quant_mode == 0) {
+      if (data.past_key == nullptr) {
+        CUDA_RETURN_IF_ERROR(cudaMemsetAsync(data.present_key, 0, cache_bytes, stream));
+      } else {
+        CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+            data.present_key, data.past_key, cache_bytes, cudaMemcpyDeviceToDevice, stream));
+      }
     } else {
-      CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-          data.present_key, data.past_key, cache_bytes, cudaMemcpyDeviceToDevice, stream));
+      if (data.past_key_q == nullptr) {
+        CUDA_RETURN_IF_ERROR(cudaMemsetAsync(data.present_key_q, 0, cache_bytes, stream));
+      } else {
+        CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+            data.present_key_q, data.past_key_q, cache_bytes, cudaMemcpyDeviceToDevice, stream));
+      }
     }
   }
   if (initialize_value_cache) {
-    if (data.past_value == nullptr) {
-      CUDA_RETURN_IF_ERROR(cudaMemsetAsync(data.present_value, 0, cache_bytes, stream));
+    if (data.kv_quant_mode == 0) {
+      if (data.past_value == nullptr) {
+        CUDA_RETURN_IF_ERROR(cudaMemsetAsync(data.present_value, 0, cache_bytes, stream));
+      } else {
+        CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+            data.present_value, data.past_value, cache_bytes, cudaMemcpyDeviceToDevice, stream));
+      }
     } else {
-      CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
-          data.present_value, data.past_value, cache_bytes, cudaMemcpyDeviceToDevice, stream));
+      if (data.past_value_q == nullptr) {
+        CUDA_RETURN_IF_ERROR(cudaMemsetAsync(data.present_value_q, 0, cache_bytes, stream));
+      } else {
+        CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
+            data.present_value_q, data.past_value_q, cache_bytes, cudaMemcpyDeviceToDevice, stream));
+      }
     }
   }
 
@@ -1851,7 +1959,8 @@ Status LaunchDynamicSparseAttention(
       parameters.kv_hidden_size, packed_stride, parameters.cache_capacity,
       parameters.rotary_dim, parameters.rotary_max_position, parameters.rotary_offset,
       parameters.rotary_interleaved, parameters.is_packed_qkv,
-      parameters.qk_norm_epsilon, data.validation_error, error_stride);
+      parameters.qk_norm_epsilon, data.validation_error, error_stride,
+      data.present_key_q, data.present_value_q, data.k_scale, data.v_scale, data.kv_quant_mode);
   CUDA_RETURN_IF_ERROR(cudaGetLastError());
 
   ORT_RETURN_IF_ERROR(CheckBlockCount(query_blocks, "attention"));
@@ -1912,7 +2021,8 @@ Status LaunchDynamicSparseAttention(
               parameters.max_selected, parameters.local_window_size, parameters.scale,
               local_plus_selected,
               parameters.selected_kv_source == DynamicSparseAttentionKvSource::kAuxiliary,
-              parameters.use_smooth_softmax, data.validation_error, error_stride, rows_per_batch);
+              parameters.use_smooth_softmax, data.validation_error, error_stride, rows_per_batch,
+              data.present_key_q, data.present_value_q, data.k_scale, data.v_scale, data.kv_quant_mode);
     } else {
       GroupedDecodeDynamicSparseAttentionKernel<T, kGroupedDecodeQueryHeadsPerBlock, false>
           <<<static_cast<int>(grouped_blocks), kGroupedDecodeThreads, grouped_shared_bytes, stream>>>(
@@ -1926,7 +2036,8 @@ Status LaunchDynamicSparseAttention(
               parameters.max_selected, parameters.local_window_size, parameters.scale,
               local_plus_selected,
               parameters.selected_kv_source == DynamicSparseAttentionKvSource::kAuxiliary,
-              parameters.use_smooth_softmax, data.validation_error, error_stride, rows_per_batch);
+              parameters.use_smooth_softmax, data.validation_error, error_stride, rows_per_batch,
+              data.present_key_q, data.present_value_q, data.k_scale, data.v_scale, data.kv_quant_mode);
     }
     CUDA_RETURN_IF_ERROR(cudaGetLastError());
 
@@ -1960,7 +2071,8 @@ Status LaunchDynamicSparseAttention(
             parameters.auxiliary_sequence_length, parameters.max_selected,
             parameters.local_window_size, parameters.scale, local_plus_selected,
             parameters.selected_kv_source == DynamicSparseAttentionKvSource::kAuxiliary,
-            parameters.use_smooth_softmax, data.validation_error);
+            parameters.use_smooth_softmax, data.validation_error,
+            data.present_key_q, data.present_value_q, data.k_scale, data.v_scale, data.kv_quant_mode);
   } else if (UseFusedAttention(parameters, sizeof(T), max_shared_memory_per_block)) {
     FusedDynamicSparseAttentionKernel<<<static_cast<int>(query_blocks), fused_threads, fused_shared_bytes, stream>>>(
         data.prepared_query, data.present_key, data.present_value,

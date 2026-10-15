@@ -50,6 +50,8 @@ struct GuardedKernel {
   uint32_t* bitmap = nullptr;
   float* workspace = nullptr;
   int32_t* row_errors = nullptr;
+  float* d_k_scale = nullptr;
+  float* d_v_scale = nullptr;
 
   GuardedKernel(const OrtApi& supplied, const OrtKernelInfo* info) : api(supplied) {
     Ort::ConstKernelInfo metadata(info);
@@ -77,10 +79,27 @@ struct GuardedKernel {
     if (!std::isfinite(parameters.scale) || parameters.scale < 0) {
       throw std::invalid_argument("GuardedDSA: invalid scale");
     }
+    std::vector<float> k_scale_host, v_scale_host;
+    try {
+      k_scale_host = metadata.GetAttributes<float>("k_scale");
+      v_scale_host = metadata.GetAttributes<float>("v_scale");
+    } catch (const std::exception&) {
+    }
     int device = 0;
     CheckCuda(cudaGetDevice(&device));
     CheckCuda(cudaGetDeviceProperties(&properties, device));
     try {
+      if (!k_scale_host.empty() || !v_scale_host.empty()) {
+        if (k_scale_host.size() != static_cast<size_t>(parameters.kv_hidden_size) ||
+            v_scale_host.size() != static_cast<size_t>(parameters.kv_hidden_size)) {
+          throw std::invalid_argument("GuardedDSA: k_scale/v_scale length must match kv_num_heads * head_size");
+        }
+        const size_t scale_bytes = k_scale_host.size() * sizeof(float);
+        CheckCuda(cudaMalloc(&d_k_scale, scale_bytes));
+        CheckCuda(cudaMalloc(&d_v_scale, scale_bytes));
+        CheckCuda(cudaMemcpy(d_k_scale, k_scale_host.data(), scale_bytes, cudaMemcpyHostToDevice));
+        CheckCuda(cudaMemcpy(d_v_scale, v_scale_host.data(), scale_bytes, cudaMemcpyHostToDevice));
+      }
       CheckCuda(cudaMalloc(&prepared, 128 * parameters.query_hidden_size * sizeof(__nv_bfloat16)));
       size_t bitmap_elements = 0;
       size_t workspace_elements = 0;
@@ -100,6 +119,8 @@ struct GuardedKernel {
       if (bitmap_elements) CheckCuda(cudaMalloc(&bitmap, bitmap_elements * sizeof(uint32_t)));
       if (workspace_elements) CheckCuda(cudaMalloc(&workspace, workspace_elements * sizeof(float)));
     } catch (...) {
+      cudaFree(d_k_scale);
+      cudaFree(d_v_scale);
       cudaFree(prepared);
       cudaFree(bitmap);
       cudaFree(workspace);
@@ -109,6 +130,8 @@ struct GuardedKernel {
   }
 
   ~GuardedKernel() {
+    cudaFree(d_k_scale);
+    cudaFree(d_v_scale);
     cudaFree(row_errors);
     cudaFree(prepared);
     cudaFree(bitmap);
@@ -156,14 +179,38 @@ struct GuardedKernel {
       data.query = bf16(0);
       data.key = bf16(1);
       data.value = bf16(2);
-      data.past_key = bf16(3);
-      data.past_value = bf16(4);
+      const auto kv_elem_type = context.GetInput(3).GetTensorTypeAndShapeInfo().GetElementType();
+      if (kv_elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16) {
+        data.kv_quant_mode = 0;
+        data.past_key = bf16(3);
+        data.past_value = bf16(4);
+        data.present_key = reinterpret_cast<__nv_bfloat16*>(present_key.GetTensorMutableData<Ort::BFloat16_t>());
+        data.present_value = reinterpret_cast<__nv_bfloat16*>(present_value.GetTensorMutableData<Ort::BFloat16_t>());
+        if (data.past_key != data.present_key || data.past_value != data.present_value) {
+          throw std::invalid_argument("GuardedDSA: caller must bind owned in-place KV outputs");
+        }
+      } else if (kv_elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 ||
+                 kv_elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN) {
+        if (!d_k_scale || !d_v_scale) {
+          throw std::invalid_argument("GuardedDSA: quantized KV requires k_scale and v_scale attributes");
+        }
+        data.kv_quant_mode = (kv_elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8) ? 1 : 2;
+        data.past_key_q = static_cast<const uint8_t*>(context.GetInput(3).GetTensorRawData());
+        data.past_value_q = static_cast<const uint8_t*>(context.GetInput(4).GetTensorRawData());
+        data.present_key_q = static_cast<uint8_t*>(present_key.GetTensorMutableRawData());
+        data.present_value_q = static_cast<uint8_t*>(present_value.GetTensorMutableRawData());
+        data.k_scale = d_k_scale;
+        data.v_scale = d_v_scale;
+        if (data.past_key_q != data.present_key_q || data.past_value_q != data.present_value_q) {
+          throw std::invalid_argument("GuardedDSA: caller must bind owned in-place quantized KV outputs");
+        }
+      } else {
+        throw std::invalid_argument("GuardedDSA: unsupported KV cache element type");
+      }
       data.selected_indices = context.GetInput(5).GetTensorData<int32_t>();
       data.selected_counts = context.GetInput(6).GetTensorData<int32_t>();
       data.seqlens_k = context.GetInput(7).GetTensorData<int32_t>();
       data.prepared_query = prepared;
-      data.present_key = reinterpret_cast<__nv_bfloat16*>(present_key.GetTensorMutableData<Ort::BFloat16_t>());
-      data.present_value = reinterpret_cast<__nv_bfloat16*>(present_value.GetTensorMutableData<Ort::BFloat16_t>());
       data.output = reinterpret_cast<__nv_bfloat16*>(output.GetTensorMutableData<Ort::BFloat16_t>());
       data.attention_workspace = workspace;
       auto error = error_output.GetTensorMutableData<int32_t>();
@@ -172,9 +219,6 @@ struct GuardedKernel {
       data.row_chain = row_chain ? params.sequence_length : 1;
       int32_t* flags = row_chain ? row_errors : error;
       data.validation_error = flags;
-      if (data.past_key != data.present_key || data.past_value != data.present_value) {
-        throw std::invalid_argument("GuardedDSA: caller must bind owned in-place KV outputs");
-      }
       void* raw_stream = nullptr;
       Ort::ThrowOnError(api.KernelContext_GetGPUComputeStream(raw_context, &raw_stream));
       auto stream = static_cast<cudaStream_t>(raw_stream);
@@ -196,16 +240,19 @@ struct GuardedKernel {
   }
 };
 
-struct GuardedOp : Ort::CustomOpBase<GuardedOp, GuardedKernel, true> {
+template <ONNXTensorElementDataType KvType>
+struct GuardedOpTyped : Ort::CustomOpBase<GuardedOpTyped<KvType>, GuardedKernel, true> {
   const char* GetName() const { return "GuardedDSA"; }
   const char* GetExecutionProviderType() const { return "CUDAExecutionProvider"; }
   size_t GetInputTypeCount() const { return 9; }
   ONNXTensorElementDataType GetInputType(size_t index) const {
-    return index < 5 ? ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32;
+    if (index == 3 || index == 4) return KvType;
+    return index < 3 ? ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32;
   }
   size_t GetOutputTypeCount() const { return 4; }
   ONNXTensorElementDataType GetOutputType(size_t index) const {
-    return index < 3 ? ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32;
+    if (index == 1 || index == 2) return KvType;
+    return index == 0 ? ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32;
   }
   OrtStatus* CreateKernelV2(const OrtApi& api, const OrtKernelInfo* info, void** kernel) const noexcept {
     try { *kernel = new GuardedKernel(api, info); return nullptr; }
@@ -220,10 +267,16 @@ extern "C" OrtStatus* ORT_API_CALL RegisterCustomOps(OrtSessionOptions* options,
   if (api == nullptr) return api_base->GetApi(1)->CreateStatus(ORT_FAIL, "Unsupported ORT API");
   Ort::InitApi(api);
   try {
-    static GuardedOp operation;
+    static GuardedOpTyped<ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16> op_bf16;
+    static GuardedOpTyped<ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8> op_int8;
+    static GuardedOpTyped<ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN> op_fp8;
     static Ort::CustomOpDomain domain("qwen.static");
     static std::once_flag registered;
-    std::call_once(registered, [&]() { domain.Add(&operation); });
+    std::call_once(registered, [&]() {
+      domain.Add(&op_bf16);
+      domain.Add(&op_int8);
+      domain.Add(&op_fp8);
+    });
     Ort::UnownedSessionOptions(options).Add(domain);
     return nullptr;
   } catch (const std::exception& error) {

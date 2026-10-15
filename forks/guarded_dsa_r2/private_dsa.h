@@ -52,6 +52,14 @@ struct DynamicSparseAttentionData {
   // R-row chain of one sequence (R <= 2, parameters.sequence_length == R): validation_error then holds one flag
   // per row and the rows run through the S=1 grouped decode path. 1 = the unchanged S=1 / prefill behaviour.
   int row_chain = 1;
+  // Quantized KV cache support: 0 = unquantized T, 1 = int8 per-channel, 2 = fp8_e4m3fn per-channel
+  int kv_quant_mode = 0;
+  const uint8_t* past_key_q = nullptr;
+  const uint8_t* past_value_q = nullptr;
+  uint8_t* present_key_q = nullptr;
+  uint8_t* present_value_q = nullptr;
+  const float* k_scale = nullptr;
+  const float* v_scale = nullptr;
 };
 
 size_t GetDynamicSparseAttentionValidationWorkspaceSize(
