@@ -91,12 +91,12 @@ __global__ void FoldMidKernel(const i64* tok01, const i64* input_ids, const int*
 __global__ void FoldMid2Kernel(const i64* tok01, const i64* input_ids, const int* status, int nst, i64* ctl, i64* ctx_commit,
                                const i64* ctx_a, const i64* ctx_b, const i64* ptrs, const unsigned short* cos_cache,
                                const unsigned short* sin_cache, i64* head_ids, int* head_c, i64* slot_ids, int* seqlens,
-                               unsigned short* cos_out, unsigned short* sin_out, i64* sel) {
+                               unsigned short* cos_out, unsigned short* sin_out, i64* sel, int rows) {
   const i64 L = ctl[1];
   const i64 c = ctl[7];
-  if (threadIdx.x >= 32) {  // rope rows for positions L+1, L+2 (32 bf16 each)
+  if (threadIdx.x >= 32) {  // rope rows for positions L+1 .. L+rows (32 bf16 each)
     const int j = threadIdx.x - 32;
-    if (j < 64) {
+    if (j < 32 * rows) {
       const i64 pos = L + 1 + (j >> 5);
       cos_out[j] = cos_cache[pos * 32 + (j & 31)];
       sin_out[j] = sin_cache[pos * 32 + (j & 31)];
@@ -104,39 +104,49 @@ __global__ void FoldMid2Kernel(const i64* tok01, const i64* input_ids, const int
     return;
   }
   if (threadIdx.x != 0) return;
-  const i64 pred0 = tok01[0];
-  const i64 pred1 = tok01[1];
-  const i64 draft = input_ids[1];
-  const bool accept = pred0 == draft;
+  int a = 0;
+  for (int j = 0; j + 1 < rows; ++j) {
+    if (tok01[j] == input_ids[j + 1]) {
+      ++a;
+    } else {
+      break;
+    }
+  }
   i64 st = 0;
   for (int k = 0; k < nst; ++k) st |= static_cast<i64>(status[k]);
-  head_ids[0] = accept ? draft : pred0;
-  head_ids[1] = pred1;
+  for (int j = 0; j < rows; ++j) {
+    head_ids[j] = (j < a) ? input_ids[j + 1] : tok01[j];
+    slot_ids[j] = c + j;
+  }
   head_c[0] = static_cast<int>(c);
-  slot_ids[0] = c;
-  slot_ids[1] = c + 1;
-  seqlens[0] = static_cast<int>(c) + 1;
-  sel[0] = accept ? 1 : 0;
+  seqlens[0] = static_cast<int>(c) + rows - 1;
+  sel[0] = a;
   if (ctl[3] != 0) return;
-  const i64 step = accept ? 2 : 1;
-  const i64* src = accept ? ctx_b : ctx_a;
+  const i64 step = a + 1;
+  const i64* src = (a == 0) ? ctx_a : (a == 1 ? ctx_b : (ctx_a + 2 * a));
   ctx_commit[0] = src[0];
   ctx_commit[1] = src[1];
   i64* result = reinterpret_cast<i64*>(ptrs[0]);
   const i64 ring = ptrs[1];
   volatile i64* r = result + 8 * (ctl[4] % ring);
-  ctl[0] = accept ? pred1 : pred0;
+  const i64 new_pending = tok01[a];
+  ctl[0] = new_pending;
   ctl[1] = L + step;
   ctl[7] = c + step;
   ctl[4] += 1;
-  ctl[5] |= (st ? 2 : 0) | ((c + 2 > kHeadCapacity) ? 4 : 0);
-  ctl[6] = accept ? 1 : 0;
-  r[1] = pred0;
-  r[2] = pred1;
-  r[3] = accept ? 1 : 0;
+  ctl[5] |= (st ? 2 : 0) | ((c + rows > kHeadCapacity) ? 4 : 0);
+  ctl[6] = a;
+  r[1] = tok01[0];
+  r[2] = tok01[1];
+  r[3] = a;
   r[4] = st;
-  r[5] = accept ? pred1 : pred0;
+  r[5] = new_pending;
   r[6] = L + step;
+  if (rows >= 3) {
+    const uint32_t p2 = static_cast<uint32_t>(tok01[2]);
+    const uint32_t p3 = (rows >= 4) ? static_cast<uint32_t>(tok01[3]) : 0u;
+    r[7] = (static_cast<i64>(p3) << 32) | static_cast<i64>(p2);
+  }
   __threadfence_system();
   r[0] = ctl[4];
 }
@@ -171,16 +181,64 @@ __global__ void EmbedNormKernel(const i64* ids, const unsigned short* table, con
 }
 
 __global__ void RowSelectKernel(const i64* sel, const unsigned short* x0, const unsigned short* x1, const unsigned short* x2,
-                                unsigned short* y0, unsigned short* y1, unsigned short* y2, int n0, int n1, int n2) {
+                                unsigned short* y0, unsigned short* y1, unsigned short* y2, int n0, int n1, int n2, int rows) {
   const int which = blockIdx.y;
   const unsigned short* x = which == 0 ? x0 : which == 1 ? x1 : x2;
   unsigned short* y = which == 0 ? y0 : which == 1 ? y1 : y2;
   const int n = which == 0 ? n0 : which == 1 ? n1 : n2;  // bf16 elements per row
-  const i64 row = sel[0] ? 1 : 0;
+  const i64 s = sel[0];
+  const i64 row = s < 0 ? 0 : (s >= rows ? rows - 1 : s);
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) y[i] = x[row * n + i];
 }
 
-__global__ void FoldTailKernel(const i64* next_token, const int* status, int nst, i64* ctl, int* done) {
+struct DraftPrepBuffers {
+  const unsigned short* buf[4];
+  const int* len[4];
+};
+
+__global__ void FoldDraftPrepKernel(const i64* next_token, i64* ctl, const i64* sel, const unsigned short* cos_cache,
+                                    const unsigned short* sin_cache, DraftPrepBuffers in_state, int stage,
+                                    i64* head_ids, int* head_c, i64* slot_ids, int* seqlens,
+                                    unsigned short* cos_out, unsigned short* sin_out,
+                                    unsigned short* out_buf, int* out_len) {
+  const i64 a = sel[0];
+  const bool muted = (ctl[3] != 0);
+  const i64 L_new = muted ? (ctl[1] + a + 1) : ctl[1];
+  const i64 c_new = muted ? (ctl[7] + a + 1) : ctl[7];
+  const i64 c_stage = c_new + (stage - 1);
+  const i64 pos_stage = L_new + stage;
+
+  if (threadIdx.x < 32) {
+    cos_out[threadIdx.x] = cos_cache[pos_stage * 32 + threadIdx.x];
+    sin_out[threadIdx.x] = sin_cache[pos_stage * 32 + threadIdx.x];
+  }
+  const int pick = (stage > 1 || a <= 0) ? 0
+                   : (a == 1 && in_state.buf[1] ? 1
+                   : (a == 2 && in_state.buf[2] ? 2
+                   : (in_state.buf[3] ? 3 : (in_state.buf[2] ? 2 : (in_state.buf[1] ? 1 : 0)))));
+  const unsigned short* src_buf = in_state.buf[pick];
+  const int* src_len = in_state.len[pick];
+  for (int i = threadIdx.x; i < 7 * 128; i += blockDim.x) {
+    out_buf[i] = src_buf[i];
+  }
+  if (threadIdx.x < 2) {
+    out_len[threadIdx.x] = src_len[threadIdx.x];
+  }
+  if (threadIdx.x == 0) {
+    const i64 tok = next_token[0];
+    head_ids[0] = tok;
+    head_c[0] = static_cast<int>(c_stage);
+    slot_ids[0] = c_stage;
+    seqlens[0] = static_cast<int>(c_stage);
+    if (!muted) {
+      const int ctl_slot = (stage == 1) ? 2 : 8;
+      ctl[ctl_slot] = tok;
+      if (c_stage + 1 > kHeadCapacity) ctl[5] |= 4;
+    }
+  }
+}
+
+__global__ void FoldTailKernel(const i64* next_token, const int* status, int nst, i64* ctl, int* done, int ctl_slot) {
   if (threadIdx.x != 0) return;
   if (ctl[3] != 0) {
     done[0] = 0;
@@ -188,7 +246,7 @@ __global__ void FoldTailKernel(const i64* next_token, const int* status, int nst
   }
   i64 st = 0;
   for (int k = 0; k < nst; ++k) st |= static_cast<i64>(status[k]);
-  ctl[2] = next_token[0];
+  ctl[ctl_slot] = next_token[0];
   if (st) ctl[5] |= 2;
   done[0] = 1;
 }
@@ -243,14 +301,16 @@ struct Mid2State {
       auto cos_cache = c.GetInput(8);
       auto sin_cache = c.GetInput(9);
       const int nst = static_cast<int>(status.GetTensorTypeAndShapeInfo().GetElementCount());
-      auto head_ids = c.GetOutput(0, std::vector<int64_t>{1, 2});
+      const int64_t rows = tok.GetTensorTypeAndShapeInfo().GetElementCount();
+      if (rows < 2 || rows > 4) throw std::invalid_argument("FoldMid2: rows must be in [2, 4]");
+      auto head_ids = c.GetOutput(0, std::vector<int64_t>{1, rows});
       auto head_c = c.GetOutput(1, std::vector<int64_t>{1});
-      auto slot_ids = c.GetOutput(2, std::vector<int64_t>{1, 2});
+      auto slot_ids = c.GetOutput(2, std::vector<int64_t>{1, rows});
       auto seqlens = c.GetOutput(3, std::vector<int64_t>{1});
-      auto cos_out = c.GetOutput(4, std::vector<int64_t>{1, 2, 32});
-      auto sin_out = c.GetOutput(5, std::vector<int64_t>{1, 2, 32});
+      auto cos_out = c.GetOutput(4, std::vector<int64_t>{1, rows, 32});
+      auto sin_out = c.GetOutput(5, std::vector<int64_t>{1, rows, 32});
       auto sel = c.GetOutput(6, std::vector<int64_t>{1});
-      FoldMid2Kernel<<<1, 96, 0, Stream(api, raw)>>>(
+      FoldMid2Kernel<<<1, static_cast<unsigned>(32 * (rows + 1)), 0, Stream(api, raw)>>>(
           tok.GetTensorData<i64>(), ids.GetTensorData<i64>(), status.GetTensorData<int>(), nst,
           const_cast<i64*>(ctl.GetTensorData<i64>()), const_cast<i64*>(ctx_commit.GetTensorData<i64>()),
           ctx_a.GetTensorData<i64>(), ctx_b.GetTensorData<i64>(), ptrs.GetTensorData<i64>(),
@@ -258,7 +318,8 @@ struct Mid2State {
           reinterpret_cast<const unsigned short*>(sin_cache.GetTensorData<Ort::BFloat16_t>()),
           head_ids.GetTensorMutableData<i64>(), head_c.GetTensorMutableData<int>(), slot_ids.GetTensorMutableData<i64>(),
           seqlens.GetTensorMutableData<int>(), reinterpret_cast<unsigned short*>(cos_out.GetTensorMutableData<Ort::BFloat16_t>()),
-          reinterpret_cast<unsigned short*>(sin_out.GetTensorMutableData<Ort::BFloat16_t>()), sel.GetTensorMutableData<i64>());
+          reinterpret_cast<unsigned short*>(sin_out.GetTensorMutableData<Ort::BFloat16_t>()), sel.GetTensorMutableData<i64>(),
+          static_cast<int>(rows));
       CheckLaunch();
       return nullptr;
     } catch (const std::exception& e) {
@@ -308,10 +369,12 @@ struct RowSelectState {
       const void* x[3];
       void* y[3];
       int n16[3];
+      int rows = 2;
       for (int i = 0; i < 3; ++i) {
         auto in = c.GetInput(1 + i);
         auto shape = in.GetTensorTypeAndShapeInfo().GetShape();
-        if (shape.size() < 2 || shape[1] != 2) throw std::invalid_argument("RowSelect: expected [1,2,...]");
+        if (shape.size() < 2 || shape[1] < 2 || shape[1] > 4) throw std::invalid_argument("RowSelect: expected [1,2..4,...]");
+        rows = static_cast<int>(shape[1]);
         int64_t row_elems = 1;
         for (size_t d = 2; d < shape.size(); ++d) row_elems *= shape[d];
         if (shape[0] != 1) throw std::invalid_argument("RowSelect: bad row size");
@@ -325,7 +388,72 @@ struct RowSelectState {
           sel.GetTensorData<i64>(), reinterpret_cast<const unsigned short*>(x[0]),
           reinterpret_cast<const unsigned short*>(x[1]), reinterpret_cast<const unsigned short*>(x[2]),
           reinterpret_cast<unsigned short*>(y[0]), reinterpret_cast<unsigned short*>(y[1]),
-          reinterpret_cast<unsigned short*>(y[2]), n16[0], n16[1], n16[2]);
+          reinterpret_cast<unsigned short*>(y[2]), n16[0], n16[1], n16[2], rows);
+      CheckLaunch();
+      return nullptr;
+    } catch (const std::exception& e) {
+      return api.CreateStatus(ORT_FAIL, e.what());
+    }
+  }
+};
+
+struct DraftPrepState {
+  const OrtApi& api;
+  int stage = 1;
+  DraftPrepState(const OrtApi& a, const OrtKernelInfo* info) : api(a) {
+    try {
+      Ort::ConstKernelInfo k(info);
+      stage = static_cast<int>(k.GetAttribute<int64_t>("stage"));
+    } catch (const std::exception&) {
+    }
+  }
+  OrtStatus* ComputeV2(OrtKernelContext* raw) noexcept {
+    try {
+      Ort::KernelContext c(raw);
+      auto tok = c.GetInput(0);
+      auto ctl = c.GetInput(1);
+      auto sel = c.GetInput(2);
+      auto cos_cache = c.GetInput(3);
+      auto sin_cache = c.GetInput(4);
+      DraftPrepBuffers in_state{};
+      const size_t n_in = c.GetInputCount();
+      for (int m = 0; m < 4; ++m) {
+        const size_t idx_buf = 5 + 2 * m;
+        const size_t idx_len = 6 + 2 * m;
+        if (idx_len < n_in) {
+          const OrtValue* vb = nullptr;
+          const OrtValue* vl = nullptr;
+          Ort::ThrowOnError(api.KernelContext_GetInput(raw, idx_buf, &vb));
+          Ort::ThrowOnError(api.KernelContext_GetInput(raw, idx_len, &vl));
+          if (vb != nullptr && vl != nullptr) {
+            const void* pb = nullptr;
+            const void* pl = nullptr;
+            Ort::ThrowOnError(api.GetTensorData(vb, &pb));
+            Ort::ThrowOnError(api.GetTensorData(vl, &pl));
+            in_state.buf[m] = static_cast<const unsigned short*>(pb);
+            in_state.len[m] = static_cast<const int*>(pl);
+          }
+        }
+      }
+      auto head_ids = c.GetOutput(0, std::vector<int64_t>{1, 1});
+      auto head_c = c.GetOutput(1, std::vector<int64_t>{1});
+      auto slot_ids = c.GetOutput(2, std::vector<int64_t>{1, 1});
+      auto seqlens = c.GetOutput(3, std::vector<int64_t>{1});
+      auto cos_out = c.GetOutput(4, std::vector<int64_t>{1, 1, 32});
+      auto sin_out = c.GetOutput(5, std::vector<int64_t>{1, 1, 32});
+      auto out_buf = c.GetOutput(6, std::vector<int64_t>{1, 7, 128});
+      auto out_len = c.GetOutput(7, std::vector<int64_t>{1, 2});
+      FoldDraftPrepKernel<<<1, 256, 0, Stream(api, raw)>>>(
+          tok.GetTensorData<i64>(), const_cast<i64*>(ctl.GetTensorData<i64>()), sel.GetTensorData<i64>(),
+          reinterpret_cast<const unsigned short*>(cos_cache.GetTensorData<Ort::BFloat16_t>()),
+          reinterpret_cast<const unsigned short*>(sin_cache.GetTensorData<Ort::BFloat16_t>()),
+          in_state, stage,
+          head_ids.GetTensorMutableData<i64>(), head_c.GetTensorMutableData<int>(),
+          slot_ids.GetTensorMutableData<i64>(), seqlens.GetTensorMutableData<int>(),
+          reinterpret_cast<unsigned short*>(cos_out.GetTensorMutableData<Ort::BFloat16_t>()),
+          reinterpret_cast<unsigned short*>(sin_out.GetTensorMutableData<Ort::BFloat16_t>()),
+          reinterpret_cast<unsigned short*>(out_buf.GetTensorMutableData<Ort::BFloat16_t>()),
+          out_len.GetTensorMutableData<int>());
       CheckLaunch();
       return nullptr;
     } catch (const std::exception& e) {
@@ -336,7 +464,14 @@ struct RowSelectState {
 
 struct TailState {
   const OrtApi& api;
-  TailState(const OrtApi& a, const OrtKernelInfo*) : api(a) {}
+  int ctl_slot = 2;
+  TailState(const OrtApi& a, const OrtKernelInfo* info) : api(a) {
+    try {
+      Ort::ConstKernelInfo k(info);
+      ctl_slot = static_cast<int>(k.GetAttribute<int64_t>("ctl_slot"));
+    } catch (const std::exception&) {
+    }
+  }
   OrtStatus* ComputeV2(OrtKernelContext* raw) noexcept {
     try {
       Ort::KernelContext c(raw);
@@ -347,7 +482,7 @@ struct TailState {
       auto done = c.GetOutput(0, std::vector<int64_t>{1});
       FoldTailKernel<<<1, 32, 0, Stream(api, raw)>>>(tok.GetTensorData<i64>(), status.GetTensorData<int>(), nst,
                                                       const_cast<i64*>(ctl.GetTensorData<i64>()),
-                                                      done.GetTensorMutableData<int>());
+                                                      done.GetTensorMutableData<int>(), ctl_slot);
       CheckLaunch();
       return nullptr;
     } catch (const std::exception& e) {
@@ -398,6 +533,16 @@ struct RowSelectOp : FoldOp<RowSelectOp, RowSelectState> {
   static constexpr std::array<ONNXTensorElementDataType, 3> kOut = {kBF, kBF, kBF};
   const char* GetName() const { return "RowSelectBf16x3"; }
 };
+struct DraftPrepOp : FoldOp<DraftPrepOp, DraftPrepState> {
+  static constexpr std::array<ONNXTensorElementDataType, 13> kIn = {
+      kI64, kI64, kI64, kBF, kBF, kBF, kI32, kBF, kI32, kBF, kI32, kBF, kI32};
+  static constexpr std::array<ONNXTensorElementDataType, 8> kOut = {
+      kI64, kI32, kI64, kI32, kBF, kBF, kBF, kI32};
+  const char* GetName() const { return "FoldDraftPrep"; }
+  OrtCustomOpInputOutputCharacteristic GetInputCharacteristic(size_t i) const {
+    return i >= 7 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
+  }
+};
 struct TailOp : FoldOp<TailOp, TailState> {
   static constexpr std::array<ONNXTensorElementDataType, 3> kIn = {kI64, kI32, kI64};
   static constexpr std::array<ONNXTensorElementDataType, 1> kOut = {kI32};
@@ -415,6 +560,7 @@ extern "C" OrtStatus* ORT_API_CALL RegisterCustomOps(OrtSessionOptions* options,
     static EmbedNormOp embed_norm;
     static Mid2Op mid2;
     static RowSelectOp row_select;
+    static DraftPrepOp draft_prep;
     static TailOp tail;
     static Ort::CustomOpDomain domain("qwen.fold");
     static std::once_flag registered;
@@ -423,6 +569,7 @@ extern "C" OrtStatus* ORT_API_CALL RegisterCustomOps(OrtSessionOptions* options,
       domain.Add(&embed_norm);
       domain.Add(&mid2);
       domain.Add(&row_select);
+      domain.Add(&draft_prep);
       domain.Add(&tail);
     });
     Ort::UnownedSessionOptions(options).Add(domain);

@@ -56,7 +56,7 @@ int64_t Count(const Ort::ConstValue& v) {
 std::vector<int64_t> Shape(const Ort::ConstValue& v) { return v.GetTensorTypeAndShapeInfo().GetShape(); }
 
 // Rows per call (speculative verify): the state-carrying ops run a chain over at most this many rows.
-constexpr int kMaxRows = 2;
+constexpr int kMaxRows = 4;
 
 // Raw device pointer of an optional trailing output (nullptr when the node does not connect it).
 void* OptionalOut(const OrtApi& api, OrtKernelContext* raw, Ort::KernelContext& c, size_t index, const std::vector<int64_t>& shape) {
@@ -83,14 +83,15 @@ struct GdnParams {
   const bf16* a_src; int64_t a_stride;
   const bf16* z_src; int64_t z_stride;
   const bf16* state; const bf16* weight;
-  bf16 *q, *k, *v, *z, *state_out, *mid_state_out;
+  bf16 *q, *k, *v, *z, *state_out;
+  bf16* mid_state_out[3];
   float *b32, *a32;
   int batch, rows, channels, q_size, k_size, heads, z_size;
 };
 
 // R rows (token = batch * rows + r) are a chain over the conv window: row r reads the 4-sample window that
 // the S=1 op would have found in its state after r previous calls. state_out is the state after the last
-// row; mid_state_out (optional) the state after row 0.
+// row; mid_state_out[m] (optional) the state after row m (m in {0, 1, 2}).
 template <int ROWS>
 __global__ void GdnPrepKernel(GdnParams p) {
   const int64_t t = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
@@ -128,10 +129,24 @@ __global__ void GdnPrepKernel(GdnParams p) {
     bf16* po = p.state_out + t * 4;
 #pragma unroll
     for (int i = 0; i < 4; ++i) po[i] = win[ROWS + i];
-    if (p.mid_state_out != nullptr) {
-      bf16* pm = p.mid_state_out + t * 4;
+    if (p.mid_state_out[0] != nullptr) {
+      bf16* pm0 = p.mid_state_out[0] + t * 4;
 #pragma unroll
-      for (int i = 0; i < 4; ++i) pm[i] = win[1 + i];
+      for (int i = 0; i < 4; ++i) pm0[i] = win[1 + i];
+    }
+    if constexpr (ROWS >= 3) {
+      if (p.mid_state_out[1] != nullptr) {
+        bf16* pm1 = p.mid_state_out[1] + t * 4;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) pm1[i] = win[2 + i];
+      }
+    }
+    if constexpr (ROWS >= 4) {
+      if (p.mid_state_out[2] != nullptr) {
+        bf16* pm2 = p.mid_state_out[2] + t * 4;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) pm2[i] = win[3 + i];
+      }
     }
     return;
   }
@@ -284,7 +299,8 @@ struct GdnRecParams {
   const bf16 *q, *k, *v;
   const float *decay, *beta, *state, *a_log, *dt_bias;
   bf16* out;
-  float *final_state, *mid_state;
+  float *final_state;
+  float* mid_state[3];
   int rows, num_heads_q, num_heads_k, num_heads_v, d_v;
   float scale;
 };
@@ -369,9 +385,9 @@ __global__ __launch_bounds__(32 * kGdnWarps) void GdnRecurrentKernel(GdnRecParam
     }
     o = GdnWarpReduce(o);
     if (lane == 0) p.out[tok * v_stride + hv * p.d_v + col] = static_cast<bf16>(p.scale * o);
-    if (t == 0 && p.mid_state != nullptr) {
+    if (t + 1 < ROWS && p.mid_state[t] != nullptr) {
 #pragma unroll
-      for (int i = 0; i < kRegs; ++i) __stcs(p.mid_state + st_off + lane + i * 32, s[i]);
+      for (int i = 0; i < kRegs; ++i) __stcs(p.mid_state[t] + st_off + lane + i * 32, s[i]);
     }
   }
 #pragma unroll
@@ -380,10 +396,15 @@ __global__ __launch_bounds__(32 * kGdnWarps) void GdnRecurrentKernel(GdnRecParam
 
 // ---------------------------------------------------------------------------------------------
 // PleMidState: the PLE conv state ([B,C,W], bf16, oldest first) and the PLE context ([B,2] int64: previous
-// token ids) after row 0 of an R-row call. conv: shift by one, append x[row 0]; context: [ctx[1], ids[0]].
+// token ids) after row m (m in {0, 1, 2}) of an R-row call.
 // ---------------------------------------------------------------------------------------------
+struct PleMidOut {
+  bf16* state[3];
+  int64_t* ctx[3];
+};
+
 __global__ void PleMidStateKernel(const bf16* state, const bf16* x, const int64_t* ctx, const int64_t* ids,
-                                  bf16* mid_state, int64_t* mid_ctx, int batch, int channels, int width,
+                                  PleMidOut out, int batch, int channels, int width,
                                   int rows, int ctx_len) {
   const int64_t t = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
   const int64_t total = static_cast<int64_t>(batch) * channels;
@@ -391,17 +412,31 @@ __global__ void PleMidStateKernel(const bf16* state, const bf16* x, const int64_
     const int bi = static_cast<int>(t / channels);
     const int c = static_cast<int>(t % channels);
     const bf16* ps = state + t * width;
-    bf16* pm = mid_state + t * width;
-    for (int j = 0; j + 1 < width; ++j) pm[j] = ps[j + 1];
-    pm[width - 1] = x[static_cast<int64_t>(bi) * rows * channels + c];
+    for (int m = 0; m < 3; ++m) {
+      const int s = m + 1;
+      if (out.state[m] != nullptr && s <= rows) {
+        bf16* pm = out.state[m] + t * width;
+        for (int j = 0; j < width; ++j) {
+          pm[j] = (j + s < width)
+                      ? ps[j + s]
+                      : x[(static_cast<int64_t>(bi) * rows + (j + s - width)) * channels + c];
+        }
+      }
+    }
     return;
   }
   const int64_t r = t - total;
   if (r < static_cast<int64_t>(batch) * ctx_len) {
     const int bi = static_cast<int>(r / ctx_len);
     const int j = static_cast<int>(r % ctx_len);
-    mid_ctx[r] = j + 1 < ctx_len ? ctx[static_cast<int64_t>(bi) * ctx_len + j + 1]
-                                 : ids[static_cast<int64_t>(bi) * rows];
+    for (int m = 0; m < 3; ++m) {
+      const int s = m + 1;
+      if (out.ctx[m] != nullptr && s <= rows) {
+        out.ctx[m][r] = (j + s < ctx_len)
+                            ? ctx[static_cast<int64_t>(bi) * ctx_len + j + s]
+                            : ids[static_cast<int64_t>(bi) * rows + (j + s - ctx_len)];
+      }
+    }
   }
 }
 
@@ -448,17 +483,26 @@ struct GdnRecurrentState {
       auto out = c.GetOutput(0, std::vector<int64_t>{batch, rows, hv, kGdnDK});
       auto fs = c.GetOutput(1, ss);
       p.out = Out<bf16>(out); p.final_state = Out<float>(fs);
-      p.mid_state = static_cast<float*>(OptionalOut(api, raw, c, 2, ss));
+      for (int m = 0; m < 3; ++m) {
+        p.mid_state[m] = static_cast<float*>(OptionalOut(api, raw, c, 2 + m, ss));
+        if (p.mid_state[m] != nullptr && p.mid_state[m] == p.state) {
+          throw std::invalid_argument("GdnRecurrent: state outputs must not alias the input state");
+        }
+      }
       p.rows = static_cast<int>(rows); p.num_heads_q = static_cast<int>(hq); p.num_heads_k = static_cast<int>(hk);
       p.num_heads_v = static_cast<int>(hv); p.d_v = kGdnDK; p.scale = scale;
-      if (p.final_state == p.state || (p.mid_state != nullptr && p.mid_state == p.state)) {
+      if (p.final_state == p.state) {
         throw std::invalid_argument("GdnRecurrent: state outputs must not alias the input state");
       }
       const dim3 grid(static_cast<unsigned>(batch), static_cast<unsigned>(hv), kGdnDK / kGdnWarps);
       if (rows == 1) {
         GdnRecurrentKernel<1><<<grid, dim3(32, kGdnWarps, 1), 0, Stream(api, raw)>>>(p);
-      } else {
+      } else if (rows == 2) {
         GdnRecurrentKernel<2><<<grid, dim3(32, kGdnWarps, 1), 0, Stream(api, raw)>>>(p);
+      } else if (rows == 3) {
+        GdnRecurrentKernel<3><<<grid, dim3(32, kGdnWarps, 1), 0, Stream(api, raw)>>>(p);
+      } else {
+        GdnRecurrentKernel<4><<<grid, dim3(32, kGdnWarps, 1), 0, Stream(api, raw)>>>(p);
       }
       CheckLaunch();
       return nullptr;
@@ -484,10 +528,17 @@ struct PleMidStateState {
       }
       auto mid = c.GetOutput(0, ss);
       auto mid_ctx = c.GetOutput(1, cs);
+      PleMidOut out{};
+      out.state[0] = Out<bf16>(mid);
+      out.ctx[0] = Out<int64_t>(mid_ctx);
+      for (int m = 1; m < 3; ++m) {
+        out.state[m] = static_cast<bf16*>(OptionalOut(api, raw, c, 2 * m, ss));
+        out.ctx[m] = static_cast<int64_t*>(OptionalOut(api, raw, c, 2 * m + 1, cs));
+      }
       const int64_t total = ss[0] * ss[1] + cs[0] * cs[1];
       PleMidStateKernel<<<(total + 255) / 256, 256, 0, Stream(api, raw)>>>(
-          In<bf16>(c, 0), In<bf16>(c, 1), In<int64_t>(c, 2), In<int64_t>(c, 3), Out<bf16>(mid),
-          Out<int64_t>(mid_ctx), static_cast<int>(ss[0]), static_cast<int>(ss[1]), static_cast<int>(ss[2]),
+          In<bf16>(c, 0), In<bf16>(c, 1), In<int64_t>(c, 2), In<int64_t>(c, 3), out,
+          static_cast<int>(ss[0]), static_cast<int>(ss[1]), static_cast<int>(ss[2]),
           static_cast<int>(xs[1]), static_cast<int>(cs[1]));
       CheckLaunch();
       return nullptr;
@@ -567,8 +618,10 @@ struct GdnPrepState {
       auto a32 = c.GetOutput(base + 2, bshape);
       p.q = Out<bf16>(q); p.k = Out<bf16>(k); p.v = Out<bf16>(v);
       p.state_out = Out<bf16>(so); p.b32 = Out<float>(b32); p.a32 = Out<float>(a32);
-      // optional trailing output: the conv state after row 0 (equals state_out when rows == 1)
-      p.mid_state_out = static_cast<bf16*>(OptionalOut(api, raw, c, base + 3, state_shape));
+      // optional trailing outputs: the conv state after rows 0, 1, 2
+      for (int m = 0; m < 3; ++m) {
+        p.mid_state_out[m] = static_cast<bf16*>(OptionalOut(api, raw, c, base + 3 + m, state_shape));
+      }
       if (kMerged) {
         auto z = c.GetOutput(3, std::vector<int64_t>{batch, rows, z_size});
         p.z = Out<bf16>(z);
@@ -579,8 +632,12 @@ struct GdnPrepState {
       const int64_t total = batch * channels + 2 * tokens * heads + tokens * p.z_size;
       if (rows == 1) {
         GdnPrepKernel<1><<<(total + 255) / 256, 256, 0, Stream(api, raw)>>>(p);
-      } else {
+      } else if (rows == 2) {
         GdnPrepKernel<2><<<(total + 255) / 256, 256, 0, Stream(api, raw)>>>(p);
+      } else if (rows == 3) {
+        GdnPrepKernel<3><<<(total + 255) / 256, 256, 0, Stream(api, raw)>>>(p);
+      } else {
+        GdnPrepKernel<4><<<(total + 255) / 256, 256, 0, Stream(api, raw)>>>(p);
       }
       CheckLaunch();
       return nullptr;
@@ -723,20 +780,20 @@ struct GdnConvPrepOp : AttnOp<GdnConvPrepOp, GdnPrepState<false>> {
   const char* GetName() const { return "GdnConvPrep"; }
   size_t GetInputTypeCount() const { return 5; }
   ONNXTensorElementDataType GetInputType(size_t) const { return kBF16; }
-  size_t GetOutputTypeCount() const { return 7; }  // [6] = optional conv state after row 0
+  size_t GetOutputTypeCount() const { return 9; }  // [6..8] = optional conv state after rows 0, 1, 2
   ONNXTensorElementDataType GetOutputType(size_t i) const { return (i == 4 || i == 5) ? kF32 : kBF16; }
   OrtCustomOpInputOutputCharacteristic GetOutputCharacteristic(size_t i) const {
-    return i == 6 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
+    return i >= 6 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
   }
 };
 struct GdnProjPrepOp : AttnOp<GdnProjPrepOp, GdnPrepState<true>> {
   const char* GetName() const { return "GdnProjPrep"; }
   size_t GetInputTypeCount() const { return 3; }
   ONNXTensorElementDataType GetInputType(size_t) const { return kBF16; }
-  size_t GetOutputTypeCount() const { return 8; }  // [7] = optional conv state after row 0
+  size_t GetOutputTypeCount() const { return 10; }  // [7..9] = optional conv state after rows 0, 1, 2
   ONNXTensorElementDataType GetOutputType(size_t i) const { return (i == 5 || i == 6) ? kF32 : kBF16; }
   OrtCustomOpInputOutputCharacteristic GetOutputCharacteristic(size_t i) const {
-    return i == 7 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
+    return i >= 7 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
   }
 };
 struct GdnRecurrentOp : AttnOp<GdnRecurrentOp, GdnRecurrentState> {
@@ -748,18 +805,21 @@ struct GdnRecurrentOp : AttnOp<GdnRecurrentOp, GdnRecurrentState> {
   OrtCustomOpInputOutputCharacteristic GetInputCharacteristic(size_t i) const {
     return i == 3 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
   }
-  size_t GetOutputTypeCount() const { return 3; }  // out, final_state, optional mid_state
+  size_t GetOutputTypeCount() const { return 5; }  // out, final_state, optional mid_state[0..2]
   ONNXTensorElementDataType GetOutputType(size_t i) const { return i == 0 ? kBF16 : kF32; }
   OrtCustomOpInputOutputCharacteristic GetOutputCharacteristic(size_t i) const {
-    return i == 2 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
+    return i >= 2 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
   }
 };
 struct PleMidStateOp : AttnOp<PleMidStateOp, PleMidStateState> {
   const char* GetName() const { return "PleMidState"; }
   size_t GetInputTypeCount() const { return 4; }
   ONNXTensorElementDataType GetInputType(size_t i) const { return i < 2 ? kBF16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64; }
-  size_t GetOutputTypeCount() const { return 2; }
-  ONNXTensorElementDataType GetOutputType(size_t i) const { return i == 0 ? kBF16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64; }
+  size_t GetOutputTypeCount() const { return 6; }  // (mid_state[0..2], mid_ctx[0..2])
+  ONNXTensorElementDataType GetOutputType(size_t i) const { return (i % 2 == 0) ? kBF16 : ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64; }
+  OrtCustomOpInputOutputCharacteristic GetOutputCharacteristic(size_t i) const {
+    return i >= 2 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
+  }
 };
 struct QkNormRopeOp : AttnOp<QkNormRopeOp, QkNormRopeState<false>> {
   const char* GetName() const { return "QkNormRope"; }

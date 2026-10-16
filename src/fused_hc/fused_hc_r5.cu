@@ -1217,23 +1217,29 @@ struct HcBlockState {
   }
 
   // Allocation and the co-residency check happen on the first (never capturing) call.
-  bool EnsureMerged(cudaStream_t stream, bool fp8) {
-    if (merged_ok >= 0) return merged_ok == 1;
-    merged_ok = 0;
-    if (!MergeEnabled()) return false;
-    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(stream, &status) != cudaSuccess || status != cudaStreamCaptureStatusNone) {
-      throw std::runtime_error("HcBlock: first execution must not happen during CUDA graph capture");
+  bool EnsureMerged(cudaStream_t stream, int64_t rows, bool fp8) {
+    if (rows < 1 || rows > 4) return false;
+    if (merged_ok < 0) {
+      merged_ok = 0;
+      if (!MergeEnabled()) return false;
+      cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+      if (cudaStreamIsCapturing(stream, &status) != cudaSuccess || status != cudaStreamCaptureStatusNone) {
+        throw std::runtime_error("HcBlock: first execution must not happen during CUDA graph capture");
+      }
+      const bool ok12 = fp8 ? (CheckResident<1, true>() && CheckResident<2, true>())
+                            : (CheckResident<1, false>() && CheckResident<2, false>());
+      if (!ok12) return false;
+      const size_t bytes = (4 * static_cast<size_t>(kTabRow) + 8) * sizeof(unsigned long long);
+      if (cudaMalloc(&tab, bytes) != cudaSuccess) return false;
+      if (cudaMemset(tab, 0, bytes) != cudaSuccess) return false;
+      ctr = tab + 4 * static_cast<size_t>(kTabRow);
+      const bool ok3 = fp8 ? CheckResident<3, true>() : CheckResident<3, false>();
+      const bool ok4 = fp8 ? CheckResident<4, true>() : CheckResident<4, false>();
+      merged_ok = 1 | (ok3 ? 2 : 0) | (ok4 ? 4 : 0);
     }
-    const bool ok = fp8 ? (CheckResident<1, true>() && CheckResident<2, true>())
-                        : (CheckResident<1, false>() && CheckResident<2, false>());
-    if (!ok) return false;
-    const size_t bytes = (2 * static_cast<size_t>(kTabRow) + 8) * sizeof(unsigned long long);
-    if (cudaMalloc(&tab, bytes) != cudaSuccess) return false;
-    if (cudaMemset(tab, 0, bytes) != cudaSuccess) return false;
-    ctr = tab + 2 * static_cast<size_t>(kTabRow);
-    merged_ok = 1;
-    return true;
+    if (merged_ok == 0) return false;
+    if (rows <= 2) return true;
+    return (merged_ok & (rows == 3 ? 2 : 4)) != 0;
   }
 
   OrtStatus* ComputeV2(OrtKernelContext* raw) noexcept {
@@ -1266,9 +1272,17 @@ struct HcBlockState {
       const bf16* gt = kPost ? In(c, 2) : nullptr;
       const void* wd_ptr = c.GetInput(o + 1).GetTensorRawData();
       const void* wu_ptr = c.GetInput(o + 3).GetTensorRawData();
-      if (tiled_d && tiled_u && (rows == 1 || rows == 2) && EnsureMerged(stream, fp8)) {
+      if (tiled_d && tiled_u && rows >= 1 && rows <= 4 && EnsureMerged(stream, rows, fp8)) {
         if (fp8) {
-          if (rows == 2) {
+          if (rows == 4) {
+            LaunchSmem(HcBlockKernel<kPost, 4, true>, dim3(kDownGridX, kSplit, 1), BlockSmemBytes<4, true>(), stream, In(c, 0), br, gt,
+                       In(c, o), wd_ptr, In(c, o + 2), wu_ptr, streams_out, scratch_ptr, Out(pre), Out(gate), epsilon, silu_alpha,
+                       reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut(), d_wd_scale, d_wu_scale);
+          } else if (rows == 3) {
+            LaunchSmem(HcBlockKernel<kPost, 3, true>, dim3(kDownGridX, kSplit, 1), BlockSmemBytes<3, true>(), stream, In(c, 0), br, gt,
+                       In(c, o), wd_ptr, In(c, o + 2), wu_ptr, streams_out, scratch_ptr, Out(pre), Out(gate), epsilon, silu_alpha,
+                       reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut(), d_wd_scale, d_wu_scale);
+          } else if (rows == 2) {
             LaunchSmem(HcBlockKernel<kPost, 2, true>, dim3(kDownGridX, kSplit, 1), BlockSmemBytes<2, true>(), stream, In(c, 0), br, gt,
                        In(c, o), wd_ptr, In(c, o + 2), wu_ptr, streams_out, scratch_ptr, Out(pre), Out(gate), epsilon, silu_alpha,
                        reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut(), d_wd_scale, d_wu_scale);
@@ -1278,7 +1292,15 @@ struct HcBlockState {
                        reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut(), d_wd_scale, d_wu_scale);
           }
         } else {
-          if (rows == 2) {
+          if (rows == 4) {
+            LaunchSmem(HcBlockKernel<kPost, 4, false>, dim3(kDownGridX, kSplit, 1), BlockSmemBytes<4, false>(), stream, In(c, 0), br, gt,
+                       In(c, o), wd_ptr, In(c, o + 2), wu_ptr, streams_out, scratch_ptr, Out(pre), Out(gate), epsilon, silu_alpha,
+                       reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut(), nullptr, nullptr);
+          } else if (rows == 3) {
+            LaunchSmem(HcBlockKernel<kPost, 3, false>, dim3(kDownGridX, kSplit, 1), BlockSmemBytes<3, false>(), stream, In(c, 0), br, gt,
+                       In(c, o), wd_ptr, In(c, o + 2), wu_ptr, streams_out, scratch_ptr, Out(pre), Out(gate), epsilon, silu_alpha,
+                       reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut(), nullptr, nullptr);
+          } else if (rows == 2) {
             LaunchSmem(HcBlockKernel<kPost, 2, false>, dim3(kDownGridX, kSplit, 1), BlockSmemBytes<2, false>(), stream, In(c, 0), br, gt,
                        In(c, o), wd_ptr, In(c, o + 2), wu_ptr, streams_out, scratch_ptr, Out(pre), Out(gate), epsilon, silu_alpha,
                        reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut(), nullptr, nullptr);
@@ -1289,7 +1311,7 @@ struct HcBlockState {
           }
         }
       } else {
-        if (fp8) throw std::invalid_argument("HcBlock: FP8 weights require tiled merged execution (rows in {1, 2})");
+        if (fp8) throw std::invalid_argument("HcBlock: FP8 weights require tiled merged execution (rows in 1..4)");
         LaunchDown<kPost, true>(rows, tiled_d, stream, In(c, 0), br, gt, In(c, o), In(c, o + 1), In(c, o + 2), streams_out,
                                 scratch_ptr, epsilon, silu_alpha, 1);
         LaunchUp(rows, tiled_u, stream, kPost ? streams_out : In(c, 0), In(c, o), In(c, o + 3), scratch_ptr, Out(pre), Out(gate),

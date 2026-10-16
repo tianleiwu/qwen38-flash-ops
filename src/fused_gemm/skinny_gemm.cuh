@@ -562,7 +562,8 @@ cudaError_t LaunchKernelW(const cudaLaunchConfig_t& cfg, const Params& p) {
 template <int M, int TX, int THREADS, int C, int U, bool FUSE = false>
 cudaError_t LaunchT(Params p, cudaStream_t stream) {
   constexpr int NCOL = TX * 8;
-  if constexpr ((THREADS / 32) * M * NCOL * 4 + (FUSE ? M * kFuseMaxK * 4 : 0) > 40 * 1024) {
+  constexpr size_t kSmemLimit = FUSE ? (44 * 1024) : (40 * 1024);
+  if constexpr ((THREADS / 32) * M * NCOL * 4 + (FUSE ? M * kFuseMaxK * 4 : 0) > kSmemLimit) {
     return cudaErrorInvalidValue;
   } else {
   int tiles = 0;
@@ -587,11 +588,9 @@ cudaError_t LaunchT(Params p, cudaStream_t stream) {
   }
   cfg.attrs = attr;
   cfg.numAttrs = n_attr;
-  if constexpr (TX >= 4 && C <= 8 && (M <= 2 || (M == 4 && TX == 8 && THREADS <= 512 && C == 8 && U == 4 && !FUSE))) {
+  if constexpr (TX >= 4 && C <= 8 && M <= 4) {
     if (p.w_mode[0] == 1) return LaunchKernelW<M, TX, THREADS, C, U, FUSE, 1>(cfg, p);
-    if constexpr (M <= 2) {
-      if (p.w_mode[0] == 2) return LaunchKernelW<M, TX, THREADS, C, U, FUSE, 2>(cfg, p);
-    }
+    if (p.w_mode[0] == 2) return LaunchKernelW<M, TX, THREADS, C, U, FUSE, 2>(cfg, p);
   }
   return LaunchKernelW<M, TX, THREADS, C, U, FUSE, 0>(cfg, p);
   }
@@ -641,14 +640,8 @@ inline cudaError_t LaunchRows(int m, const Params& p, const Config& cfg, cudaStr
     case 1: return DispatchThreads<1>(p, cfg, s);
 #ifndef SKINNY_M1_ONLY
     case 2: return DispatchThreads<2>(p, cfg, s);
-    case 4:
-      if (cfg.tx == 8 && cfg.threads == 256 && cfg.cluster == 8 && cfg.unroll == 4)
-        return LaunchT<4, 8, 256, 8, 4>(p, s);
-      if (cfg.tx == 8 && cfg.threads == 256 && cfg.cluster == 4 && cfg.unroll == 4)
-        return LaunchT<4, 8, 256, 4, 4>(p, s);
-      if (cfg.tx == 8 && cfg.threads == 256 && cfg.cluster == 2 && cfg.unroll == 4)
-        return LaunchT<4, 8, 256, 2, 4>(p, s);
-      return cudaErrorInvalidValue;
+    case 3: return DispatchThreads<3>(p, cfg, s);
+    case 4: return DispatchThreads<4>(p, cfg, s);
 #endif
     default: return cudaErrorInvalidValue;
   }
@@ -664,7 +657,7 @@ inline cudaError_t Launch(int m, const Params& p, const Config& cfg, cudaStream_
   int done = 0;
   while (done < m) {
     int chunk = std::min(m - done, 4);
-    while (chunk > 1 && (chunk == 3 || !RowsFit(chunk, cfg))) --chunk;
+    while (chunk > 1 && !RowsFit(chunk, cfg)) --chunk;
     Params q = p;
     q.x = p.x + static_cast<size_t>(done) * p.K;
     if (done + chunk < m) q.trigger = 0;  // only the last row block may release PDL dependents
@@ -676,7 +669,7 @@ inline cudaError_t Launch(int m, const Params& p, const Config& cfg, cudaStream_
   return cudaSuccess;
 }
 
-// Fused shared-expert down projection (M == 1): see Params::x2/gx/gw/routed.
+// Fused shared-expert down projection (M == 1..4): see Params::x2/gx/gw/routed.
 template <int M, int THREADS, int C>
 cudaError_t FusedTX(const Params& p, int tx, cudaStream_t s) {
   switch (tx) {
@@ -705,6 +698,8 @@ inline cudaError_t LaunchFused(int m, const Params& p, const Config& cfg, cudaSt
     case 1: return FusedRows<1>(p, cfg, s);
 #ifndef SKINNY_M1_ONLY
     case 2: return FusedRows<2>(p, cfg, s);
+    case 3: return FusedRows<3>(p, cfg, s);
+    case 4: return FusedRows<4>(p, cfg, s);
 #endif
     default: return cudaErrorInvalidValue;
   }

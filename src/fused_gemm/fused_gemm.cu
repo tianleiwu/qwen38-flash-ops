@@ -159,7 +159,7 @@ struct SkinnyGemmKernelState {
       const int K = static_cast<int>(xshape.back());
       int64_t m64 = 1;
       for (size_t i = 0; i + 1 < xshape.size(); ++i) m64 *= xshape[i];
-      if (m64 < 1 || m64 > 8) throw std::invalid_argument("SkinnyGemm: M must be in [1, 8]");
+      if (m64 < 1 || m64 > 32) throw std::invalid_argument("SkinnyGemm: M must be in [1, 32]");
       const int M = static_cast<int>(m64);
 
       skinny::Params p = {};

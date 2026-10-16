@@ -268,29 +268,45 @@ __global__ void QsaUpdateStateKernel(const T* key, const T* key_norm_weight, con
     // themselves are shared with present_key_state (slots at or beyond the mid length are garbage on a
     // rejected draft and are overwritten when the block really closes). The mid buffer is a full image
     // (stale slots included) so that it is bit-identical to the present buffer of an S=1 call on row 0.
-    const int mid_req = min(req_len, 1);
-    const int mid_pending = old_buf_len + mid_req;
-    const int mid_blocks = rejected ? 0 : mid_pending / params.compress_ratio;
-    const int mid_buf_len = rejected ? old_buf_len : mid_pending % params.compress_ratio;
-    if (params.mid_state_lengths != nullptr && params.mid_kv_buffer != nullptr) {
-      if (threadIdx.x == 0) {
-        params.mid_state_lengths[b * 2 + psai::kKeyStateLength] = old_key_len + mid_blocks;
-        params.mid_state_lengths[b * 2 + psai::kBufferLength] = mid_buf_len;
+    auto virtual_pos_after_steps = [&](int n_steps, int t) -> int {
+      for (int s = n_steps; s >= 1; --s) {
+        const int pend = old_buf_len + s;
+        const int blen = pend % params.compress_ratio;
+        if (t < blen) {
+          const int blks = pend / params.compress_ratio;
+          return blks * params.compress_ratio + t;
+        }
       }
-      T* mid_buffer = static_cast<T*>(params.mid_kv_buffer);
-      const int mid_total = params.buffer_capacity * params.head_size;
-      for (int i = static_cast<int>(threadIdx.x); i < mid_total; i += static_cast<int>(blockDim.x)) {
-        const int t = i / params.head_size;
-        const int d = i - t * params.head_size;
-        const int virtual_pos = mid_blocks * params.compress_ratio + t;
-        const int64_t slot = static_cast<int64_t>(b) * params.buffer_capacity * params.head_size + i;
-        if (t >= mid_buf_len || rejected) {
-          mid_buffer[slot] = past_kv_buffer[slot];
-        } else {
-          mid_buffer[slot] =
-              virtual_pos < old_buf_len
-                  ? past_kv_buffer[(static_cast<int64_t>(b) * params.buffer_capacity + virtual_pos) * params.head_size + d]
-                  : key[(static_cast<int64_t>(req_start) + (virtual_pos - old_buf_len)) * params.key_row_stride + d];
+      return -1;
+    };
+
+    void* mid_bufs[3] = {params.mid_kv_buffer, params.mid_kv_buffer_extra[0], params.mid_kv_buffer_extra[1]};
+    int32_t* mid_lens[3] = {params.mid_state_lengths, params.mid_state_lengths_extra[0], params.mid_state_lengths_extra[1]};
+    for (int m = 0; m < 3; ++m) {
+      if (mid_lens[m] != nullptr && mid_bufs[m] != nullptr) {
+        const int mid_req = min(req_len, m + 1);
+        const int mid_pending = old_buf_len + mid_req;
+        const int mid_blocks = rejected ? 0 : mid_pending / params.compress_ratio;
+        const int mid_buf_len = rejected ? old_buf_len : mid_pending % params.compress_ratio;
+        if (threadIdx.x == 0) {
+          mid_lens[m][b * 2 + psai::kKeyStateLength] = old_key_len + mid_blocks;
+          mid_lens[m][b * 2 + psai::kBufferLength] = mid_buf_len;
+        }
+        T* mid_buffer = static_cast<T*>(mid_bufs[m]);
+        const int mid_total = params.buffer_capacity * params.head_size;
+        for (int i = static_cast<int>(threadIdx.x); i < mid_total; i += static_cast<int>(blockDim.x)) {
+          const int t = i / params.head_size;
+          const int d = i - t * params.head_size;
+          const int virtual_pos = rejected ? -1 : virtual_pos_after_steps(mid_req, t);
+          const int64_t slot = static_cast<int64_t>(b) * params.buffer_capacity * params.head_size + i;
+          if (virtual_pos < 0) {
+            mid_buffer[slot] = past_kv_buffer[slot];
+          } else {
+            mid_buffer[slot] =
+                virtual_pos < old_buf_len
+                    ? past_kv_buffer[(static_cast<int64_t>(b) * params.buffer_capacity + virtual_pos) * params.head_size + d]
+                    : key[(static_cast<int64_t>(req_start) + (virtual_pos - old_buf_len)) * params.key_row_stride + d];
+          }
         }
       }
     }
@@ -366,30 +382,17 @@ __global__ void QsaUpdateStateKernel(const T* key, const T* key_norm_weight, con
     for (int i = static_cast<int>(threadIdx.x); i < buf_total; i += static_cast<int>(blockDim.x)) {
       const int t = i / params.head_size;
       const int d = i - t * params.head_size;
+      const int virtual_pos = rejected ? -1 : virtual_pos_after_steps(req_len, t);
       const int64_t slot = static_cast<int64_t>(b) * buf_total + i;
-      if (rejected) {
+      if (virtual_pos < 0) {
         if (present_kv_buffer != past_kv_buffer) {
           present_kv_buffer[slot] = past_kv_buffer[slot];
         }
-      } else if (t < new_buf_len) {
-        const int virtual_pos = new_block_count * params.compress_ratio + t;
-        const float value =
-            virtual_pos < old_buf_len
-                ? to_float<T>(past_kv_buffer[(static_cast<int64_t>(b) * params.buffer_capacity + virtual_pos) *
-                                                 params.head_size +
-                                             d])
-                : to_float<T>(key[(static_cast<int64_t>(req_start) + (virtual_pos - old_buf_len)) *
-                                      params.key_row_stride +
-                                  d]);
-        present_kv_buffer[slot] = from_float<T>(value);
-      } else if (t < mid_buf_len) {
-        const int virtual_pos = mid_blocks * params.compress_ratio + t;
+      } else {
         present_kv_buffer[slot] =
             virtual_pos < old_buf_len
                 ? past_kv_buffer[(static_cast<int64_t>(b) * params.buffer_capacity + virtual_pos) * params.head_size + d]
                 : key[(static_cast<int64_t>(req_start) + (virtual_pos - old_buf_len)) * params.key_row_stride + d];
-      } else if (present_kv_buffer != past_kv_buffer) {
-        present_kv_buffer[slot] = past_kv_buffer[slot];
       }
     }
     __syncthreads();

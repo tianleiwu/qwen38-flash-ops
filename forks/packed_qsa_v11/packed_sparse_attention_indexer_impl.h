@@ -38,10 +38,12 @@ struct PackedSparseAttentionIndexerParams {
   int block_topk = 0;  // token_budget / compress_ratio
   int state_update_capacity = 0;
 
-  // policy_mode = "qsa", optional: state after the first request token only (speculative verify).
-  void* mid_kv_buffer = nullptr;         // [batch, buffer_capacity, head_size] T
-  int32_t* mid_state_lengths = nullptr;  // [batch, 2]
-  int rejected_status_code = 1;          // status value written to overflow_flags on rejection
+  // policy_mode = "qsa", optional: state after the first/second/third request tokens (speculative verify).
+  void* mid_kv_buffer = nullptr;                        // [batch, buffer_capacity, head_size] T (after token 1)
+  int32_t* mid_state_lengths = nullptr;                 // [batch, 2] (after token 1)
+  void* mid_kv_buffer_extra[2] = {nullptr, nullptr};    // after tokens 2 and 3
+  int32_t* mid_state_lengths_extra[2] = {nullptr, nullptr};
+  int rejected_status_code = 1;                         // status value written to overflow_flags on rejection
 
   // policy_mode = "csa"
   int index_topk = 0;

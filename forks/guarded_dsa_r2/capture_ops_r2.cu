@@ -17,7 +17,7 @@ namespace native = onnxruntime::contrib::cuda::static_capture;
 
 namespace {
 
-constexpr size_t kMaxRows = 2;
+constexpr size_t kMaxRows = 4;
 
 void CheckCuda(cudaError_t error) {
   if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));

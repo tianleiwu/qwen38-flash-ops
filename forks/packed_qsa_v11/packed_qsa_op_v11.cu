@@ -23,13 +23,6 @@ namespace {
 
 using QsaState = packed::QsaStateType<__nv_bfloat16>;
 
-// S=1: status 9. R=2 rows: one nibble per row (row 0 low, row 1 high); a rejected step rejects both rows.
-__global__ void MapValidationStatus(int32_t* status, int rows) {
-  if (threadIdx.x == 0 && blockIdx.x == 0 && status[0] != 0) {
-    status[0] = rows >= 2 ? 0x99 : 9;
-  }
-}
-
 void CheckCuda(cudaError_t error) {
   if (error != cudaSuccess) {
     throw std::runtime_error(cudaGetErrorString(error));
@@ -181,17 +174,21 @@ struct PackedQsaKernel {
           context.GetOutput(3, {1, buffer_capacity, head_size});
       auto present_lengths = context.GetOutput(5, {1, 2});
       auto validation_status = context.GetOutput(6, {1});
-      // optional outputs 7/8: state after row 0 (pending buffer image, key/pending lengths)
-      void* mid_buffer = nullptr;
-      void* mid_lengths = nullptr;
-      if (context.GetOutputCount() > 7) {
-        mid_buffer = OptionalOutput(raw_context, 7, {1, buffer_capacity, head_size});
-      }
-      if (context.GetOutputCount() > 8) {
-        mid_lengths = OptionalOutput(raw_context, 8, {1, 2});
-      }
-      if ((mid_buffer == nullptr) != (mid_lengths == nullptr)) {
-        throw std::invalid_argument("PackedQSAIndexer: mid buffer and mid lengths must be connected together");
+      // optional outputs 7/8 (after row 0), 9/10 (after row 1), 11/12 (after row 2)
+      void* mid_buffer[3] = {nullptr, nullptr, nullptr};
+      void* mid_lengths[3] = {nullptr, nullptr, nullptr};
+      for (int m = 0; m < 3; ++m) {
+        const size_t idx_buf = 7 + 2 * m;
+        const size_t idx_len = 8 + 2 * m;
+        if (context.GetOutputCount() > idx_buf) {
+          mid_buffer[m] = OptionalOutput(raw_context, idx_buf, {1, buffer_capacity, head_size});
+        }
+        if (context.GetOutputCount() > idx_len) {
+          mid_lengths[m] = OptionalOutput(raw_context, idx_len, {1, 2});
+        }
+        if ((mid_buffer[m] == nullptr) != (mid_lengths[m] == nullptr)) {
+          throw std::invalid_argument("PackedQSAIndexer: mid buffer and mid lengths must be connected together");
+        }
       }
 
       packed::PackedSparseAttentionIndexerParams params;
@@ -214,9 +211,16 @@ struct PackedQsaKernel {
       params.epsilon = epsilon;
       params.scale = scale;
       params.block_topk = token_budget / compress_ratio;
-      params.mid_kv_buffer = mid_buffer;
-      params.mid_state_lengths = static_cast<int32_t*>(mid_lengths);
-      params.rejected_status_code = total_tokens >= 2 ? 0x99 : 9;
+      params.mid_kv_buffer = mid_buffer[0];
+      params.mid_state_lengths = static_cast<int32_t*>(mid_lengths[0]);
+      params.mid_kv_buffer_extra[0] = mid_buffer[1];
+      params.mid_state_lengths_extra[0] = static_cast<int32_t*>(mid_lengths[1]);
+      params.mid_kv_buffer_extra[1] = mid_buffer[2];
+      params.mid_state_lengths_extra[1] = static_cast<int32_t*>(mid_lengths[2]);
+      int rejected_mask = 0;
+      const int n_rows = total_tokens < 1 ? 1 : (total_tokens > 8 ? 8 : static_cast<int>(total_tokens));
+      for (int r = 0; r < n_rows; ++r) rejected_mask |= (9 << (4 * r));
+      params.rejected_status_code = rejected_mask;
 
       void* raw_stream = nullptr;
       Ort::ThrowOnError(
@@ -307,14 +311,14 @@ struct PackedQsaOp : Ort::CustomOpBase<PackedQsaOp, PackedQsaKernel, true> {
                ? INPUT_OUTPUT_OPTIONAL
                : INPUT_OUTPUT_REQUIRED;
   }
-  size_t GetOutputTypeCount() const { return 9; }
+  size_t GetOutputTypeCount() const { return 13; }
   ONNXTensorElementDataType GetOutputType(size_t index) const {
 #if defined(PACKED_QSA_EXACT_FLOAT_STATE)
     if (index == 2) {
       return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
     }
 #endif
-    return index == 0 || index == 1 || index == 5 || index == 6 || index == 8
+    return index == 0 || index == 1 || index == 5 || index == 6 || index == 8 || index == 10 || index == 12
                ? ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
                : ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
   }
