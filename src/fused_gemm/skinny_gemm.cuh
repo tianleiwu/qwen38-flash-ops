@@ -229,7 +229,11 @@ __device__ __forceinline__ void StoreOut(const Params& p, int seg, int m, int n,
   if constexpr (FUSE) {
     const float shared = Round(Round(v) * gate);
     const size_t o = static_cast<size_t>(m) * p.n[seg] + n;
-    p.out[0][o] = __float2bfloat16(__bfloat162float(p.routed[o]) + shared);
+    if (p.routed == nullptr) {
+      p.out[0][o] = __float2bfloat16(shared);
+    } else {
+      p.out[0][o] = __float2bfloat16(__bfloat162float(p.routed[o]) + shared);
+    }
   } else {
     Store(p, seg, m, n, v);
   }

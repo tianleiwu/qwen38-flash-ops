@@ -16,7 +16,10 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -26,6 +29,66 @@
 #include "skinny_gemm.cuh"
 
 namespace {
+
+struct QMoESharedExpertBridge {
+  static constexpr uint64_t kMagic = 0x514d4f4553484558ULL;
+  static constexpr int kMaxRegisteredNames = 256;
+  static constexpr int kMaxNameLen = 128;
+  uint64_t magic = kMagic;
+  std::atomic<int> lock{0};
+  std::atomic<int> num_registered{0};
+  char registered_routed_names[kMaxRegisteredNames][kMaxNameLen]{};
+  bool pending = false;
+  cudaStream_t stream = nullptr;
+  const void* routed_output_ptr = nullptr;
+  int tile_rows = 0;
+  int hidden_size = 0;
+  int (*launch_deferred)(void* ctx, cudaStream_t stream, void* shared_out_ptr, int trigger) = nullptr;
+  void* ctx = nullptr;
+
+  void RegisterRoutedName(const char* name) noexcept {
+    if (!name || !*name) return;
+    while (lock.exchange(1, std::memory_order_acquire) != 0) {
+    }
+    const int n = num_registered.load(std::memory_order_relaxed);
+    bool exists = false;
+    for (int i = 0; i < n; ++i) {
+      if (std::strncmp(registered_routed_names[i], name, kMaxNameLen - 1) == 0) {
+        exists = true;
+        break;
+      }
+    }
+    if (!exists && n < kMaxRegisteredNames) {
+      std::strncpy(registered_routed_names[n], name, kMaxNameLen - 1);
+      registered_routed_names[n][kMaxNameLen - 1] = '\0';
+      num_registered.store(n + 1, std::memory_order_release);
+    }
+    lock.store(0, std::memory_order_release);
+  }
+};
+
+inline QMoESharedExpertBridge* GetQMoESharedExpertBridge() noexcept {
+  static QMoESharedExpertBridge* const instance = []() -> QMoESharedExpertBridge* {
+    constexpr const char* kEnvVar = "ORT_QMOE_SHARED_EXPERT_BRIDGE_PTR";
+    if (const char* env = std::getenv(kEnvVar); env && *env) {
+      unsigned long long raw_addr = 0;
+      if (std::sscanf(env, "%llx", &raw_addr) == 1 && raw_addr != 0) {
+        auto* p = reinterpret_cast<QMoESharedExpertBridge*>(static_cast<uintptr_t>(raw_addr));
+        if (p->magic == QMoESharedExpertBridge::kMagic) return p;
+      }
+    }
+    auto* p = new QMoESharedExpertBridge();
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%llx", static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(p)));
+#if defined(_WIN32)
+    _putenv_s(kEnvVar, buf);
+#else
+    setenv(kEnvVar, buf, 1);
+#endif
+    return p;
+  }();
+  return instance;
+}
 
 using skinny::bf16;
 
@@ -235,6 +298,13 @@ struct SharedExpertDownKernelState {
 
   SharedExpertDownKernelState(const OrtApi& a, const OrtKernelInfo* info) : api(a), trigger(TriggerAttr(info)) {
     Ort::ConstKernelInfo k(info);
+    try {
+      if (k.GetInputCount() >= 6) {
+        const std::string routed_name = k.GetInputName(5);
+        GetQMoESharedExpertBridge()->RegisterRoutedName(routed_name.c_str());
+      }
+    } catch (const std::exception&) {
+    }
     std::vector<float> scale_host;
     try {
       scale_host = k.GetAttributes<float>("w_scale");
@@ -321,7 +391,23 @@ struct SharedExpertDownKernelState {
         cfg.threads = 512;
       }
       cfg.unroll = 8;
-      cudaError_t err = skinny::LaunchFused(static_cast<int>(M), p, cfg, Stream(api, raw));
+      cudaStream_t stream = Stream(api, raw);
+      auto* bridge = GetQMoESharedExpertBridge();
+      if (bridge && bridge->pending && bridge->stream == stream && bridge->routed_output_ptr == p.routed &&
+          bridge->launch_deferred != nullptr) {
+        bridge->pending = false;
+        skinny::Params p_proj = p;
+        p_proj.routed = nullptr;
+        p_proj.trigger = 0;
+        cudaError_t err = skinny::LaunchFused(static_cast<int>(M), p_proj, cfg, stream);
+        if (err == cudaSuccess) err = cudaGetLastError();
+        if (err != cudaSuccess) throw std::runtime_error(std::string("SharedExpertDown(proj): ") + cudaGetErrorString(err));
+        if (bridge->launch_deferred(bridge->ctx, stream, p.out[0], trigger) != 0) {
+          throw std::runtime_error("SharedExpertDown: deferred QMoE merge+finalize+combine failed");
+        }
+        return nullptr;
+      }
+      cudaError_t err = skinny::LaunchFused(static_cast<int>(M), p, cfg, stream);
       if (err == cudaSuccess) err = cudaGetLastError();
       if (err != cudaSuccess) throw std::runtime_error(std::string("SharedExpertDown: ") + cudaGetErrorString(err));
       return nullptr;
