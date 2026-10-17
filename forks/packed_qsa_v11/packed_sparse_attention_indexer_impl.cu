@@ -26,6 +26,7 @@
 // See docs/contrib_ops/cuda/packed_sparse_attention_indexer.md for the full operator contract.
 
 #include "packed_sparse_attention_indexer_impl.h"
+#include "qsa_topk.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -52,6 +53,7 @@ namespace {
 constexpr int kThreads = 128;
 constexpr int kWarpSize = 32;
 constexpr int kBoundedTopKMax = 512;
+static_assert(kBoundedTopKMax == qsa_topk::kTopK);
 constexpr int kBoundedTopKItemsPerThread = kBoundedTopKMax / kThreads;
 constexpr int kDistributedTopKMaxRows = 64;
 constexpr int kDistributedTopKMinBlocks = 2048;
@@ -785,64 +787,6 @@ __device__ __forceinline__ uint64_t QsaMergeRank(const uint64_t* left, int left_
     }
   }
   return topk::kPaddingSortKey;
-}
-
-__global__ void QsaCompactTileTopKKernel(const uint64_t* input_keys, uint64_t* output_keys,
-                                         int input_stride, int output_stride, int start_width) {
-  constexpr int kChunkSize = 2048;
-  static_assert(kChunkSize % kHierarchicalTileBlocks == 0);
-  __shared__ uint64_t shared_keys[2][kChunkSize];
-  const int chunk_start = static_cast<int>(blockIdx.x) * kChunkSize;
-  const int64_t input_base = static_cast<int64_t>(blockIdx.y) * input_stride + chunk_start;
-  const int64_t output_base = static_cast<int64_t>(blockIdx.y) * output_stride +
-                              static_cast<int>(blockIdx.x) * kBoundedTopKMax;
-  if (input_keys[input_base] == topk::kPaddingSortKey) {
-    for (int rank = threadIdx.x; rank < kBoundedTopKMax; rank += blockDim.x) {
-      output_keys[output_base + rank] = topk::kPaddingSortKey;
-    }
-    return;
-  }
-  for (int index = threadIdx.x; index < kChunkSize; index += blockDim.x) {
-    shared_keys[0][index] = chunk_start + index < input_stride
-                                ? input_keys[input_base + index]
-                                : topk::kPaddingSortKey;
-    shared_keys[1][index] = topk::kPaddingSortKey;
-  }
-  __syncthreads();
-  int input_bank = 0;
-  for (int width = start_width; width < kChunkSize; width *= 2) {
-    if (shared_keys[input_bank][width] == topk::kPaddingSortKey) {
-      break;
-    }
-    const int count = min(width, kBoundedTopKMax);
-    const int output_count = min(count * 2, kBoundedTopKMax);
-    const int pairs = kChunkSize / (width * 2);
-    for (int index = threadIdx.x; index < pairs * output_count; index += blockDim.x) {
-      const int pair_start = (index / output_count) * width * 2;
-      const int rank = index % output_count;
-      const uint64_t* left = shared_keys[input_bank] + pair_start;
-      if (left[0] == topk::kPaddingSortKey) {
-        if (rank == 0) {
-          shared_keys[1 - input_bank][pair_start] = topk::kPaddingSortKey;
-        }
-        break;
-      }
-      const uint64_t* right = left + width;
-      // Same shortcuts as QsaMergeTileTopKKernel: empty lists are padding, so skip the rank search.
-      uint64_t key;
-      if (right[0] == topk::kPaddingSortKey) {
-        key = rank < count ? left[rank] : topk::kPaddingSortKey;
-      } else {
-        key = QsaMergeRank(left, count, right, count, rank);
-      }
-      shared_keys[1 - input_bank][pair_start + rank] = key;
-    }
-    __syncthreads();
-    input_bank = 1 - input_bank;
-  }
-  for (int rank = threadIdx.x; rank < kBoundedTopKMax; rank += blockDim.x) {
-    output_keys[output_base + rank] = shared_keys[input_bank][rank];
-  }
 }
 
 __global__ void QsaFinalMergeAndEmitKernel(const uint64_t* compacted_keys,
@@ -1693,11 +1637,11 @@ Status LaunchQsaPackedSparseAttentionIndexer(
           present_key_state, query_rotated, cumulative_sequence_lengths, past_sequence_lengths, position_ids,
           present_state_lengths, overflow_flags, merge_input, tile_count, params);
     }
-    const int chunks = (key_stride + 2047) / 2048;
+    const int chunks = (key_stride + qsa_topk::kChunkSize - 1) / qsa_topk::kChunkSize;
     const int compact_stride = chunks * kBoundedTopKMax;
-    QsaCompactTileTopKKernel<<<dim3(static_cast<unsigned>(chunks), static_cast<unsigned>(params.total_tokens)),
-                               kHierarchicalScoreThreads, 0, stream>>>(
-        merge_input, merge_output, key_stride, compact_stride, tile_width);
+    qsa_topk::QsaCompactTileTopKKernel<<<dim3(static_cast<unsigned>(chunks), static_cast<unsigned>(params.total_tokens)),
+                               qsa_topk::kThreads, 0, stream>>>(
+        merge_input, merge_output, key_stride, compact_stride);
     std::swap(merge_input, merge_output);
     if (chunks <= 5) {
       QsaFinalMergeAndEmitKernel<<<token_blocks, kBoundedTopKMax, 0, stream>>>(

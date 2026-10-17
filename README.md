@@ -140,6 +140,10 @@ whole stack also needs ~113 GiB of a 141 GB H200 for the dense prefill warm-up.)
 
 `tests/test_load.py` registers every built library in an `InferenceSession` and runs one-node models on the CUDA EP against a
 torch reference: `SigmoidGateMul`, `SwishMul`, `ArgmaxRows` (BF16/FP32, tie-break), `Bf16ArgMax`.
+With `QWEN38_BUILD_ORT_FORKS=ON`, `qsa_topk` also checks QSA compaction against an exact CPU sort through
+CUDA graph replay: both score-tile layouts, ties, empty rows, partial chunks, and changing context lengths.
+The compactor reuses QMoE/GenAI's stable-key CUB block merge-sort approach, selecting a 512-, 1024-, or
+2048-key sort from device-side visibility. It retains the existing workspace and final merge ABI.
 The model-level gates (token identity of a package built with these libraries) live in the GenAI repository tools
 (`tools/qwen38_graph/engine_gate.py`); `VERIFICATION.md` summarises the run that checked this repository against the shipped libraries.
 
