@@ -167,6 +167,70 @@ __global__ void GdnPrepKernel(GdnParams p) {
   }
 }
 
+__global__ void GdnPrepMultiRowKernel(GdnParams p) {
+  const int64_t t = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+  const int64_t conv_total = static_cast<int64_t>(p.batch) * p.channels;
+  const int64_t tokens = static_cast<int64_t>(p.batch) * p.rows;
+  if (t < conv_total) {
+    const int bi = static_cast<int>(t / p.channels);
+    const int c = static_cast<int>(t % p.channels);
+    const bf16* ps = p.state + t * 4;
+    const bf16* w = p.weight + static_cast<int64_t>(c) * 4;
+    bf16 w0 = ps[0], w1 = ps[1], w2 = ps[2], w3 = ps[3];
+    for (int r = 0; r < p.rows; ++r) {
+      const int64_t tok = static_cast<int64_t>(bi) * p.rows + r;
+      const bf16 x = p.x[tok * p.x_stride + c];
+      float sum = 0.0f;
+      sum += F(w[0]) * F(w1);
+      sum += F(w[1]) * F(w2);
+      sum += F(w[2]) * F(w3);
+      sum += F(w[3]) * F(x);
+      sum = sum / (1.0f + expf(-sum));
+      const bf16 y = B(sum);
+      if (c < p.q_size) {
+        p.q[tok * p.q_size + c] = y;
+      } else if (c < p.q_size + p.k_size) {
+        p.k[tok * p.k_size + (c - p.q_size)] = y;
+      } else {
+        const int vs = p.channels - p.q_size - p.k_size;
+        p.v[tok * vs + (c - p.q_size - p.k_size)] = y;
+      }
+      w0 = w1;
+      w1 = w2;
+      w2 = w3;
+      w3 = x;
+      if (r < 3 && p.mid_state_out[r] != nullptr) {
+        bf16* pm = p.mid_state_out[r] + t * 4;
+        pm[0] = w0;
+        pm[1] = w1;
+        pm[2] = w2;
+        pm[3] = w3;
+      }
+    }
+    bf16* po = p.state_out + t * 4;
+    po[0] = w0;
+    po[1] = w1;
+    po[2] = w2;
+    po[3] = w3;
+    return;
+  }
+  int64_t r = t - conv_total;
+  const int64_t ba = tokens * p.heads;
+  if (r < ba) {
+    p.b32[r] = F(p.b_src[(r / p.heads) * p.b_stride + r % p.heads]);
+    return;
+  }
+  r -= ba;
+  if (r < ba) {
+    p.a32[r] = F(p.a_src[(r / p.heads) * p.a_stride + r % p.heads]);
+    return;
+  }
+  r -= ba;
+  if (r < tokens * p.z_size) {
+    p.z[r] = p.z_src[(r / p.z_size) * p.z_stride + r % p.z_size];
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // QkNormRope / QsaProjPrep: Cast(fp32) + RMSNorm chain (Mul, ReduceMean, Add, Sqrt, Reciprocal, Mul,
 // Mul, Cast) + RotaryEmbedding (non-interleaved, partial rotary) for the q and k heads of a QSA layer.
@@ -394,6 +458,80 @@ __global__ __launch_bounds__(32 * kGdnWarps) void GdnRecurrentKernel(GdnRecParam
   for (int i = 0; i < kRegs; ++i) __stcs(p.final_state + st_off + lane + i * 32, s[i]);
 }
 
+__global__ __launch_bounds__(32 * kGdnWarps) void GdnRecurrentMultiRowKernel(GdnRecParams p) {
+  constexpr int DK = kGdnDK;
+  constexpr int kRegs = DK / 32;
+  const int lane = threadIdx.x;
+  const int warp = threadIdx.y;
+  const int b = blockIdx.x, hv = blockIdx.y;
+  const int col = blockIdx.z * kGdnWarps + warp;
+  if (col >= p.d_v) return;
+
+  const int hq = hv * p.num_heads_q / p.num_heads_v;
+  const int hk = hv * p.num_heads_k / p.num_heads_v;
+  const int64_t tok_base = static_cast<int64_t>(b) * p.rows;
+  const int64_t q_stride = static_cast<int64_t>(p.num_heads_q) * DK;
+  const int64_t k_stride = static_cast<int64_t>(p.num_heads_k) * DK;
+  const int64_t v_stride = static_cast<int64_t>(p.num_heads_v) * p.d_v;
+  const int64_t st_off = (static_cast<int64_t>(b) * p.num_heads_v + hv) * static_cast<int64_t>(p.d_v) * DK +
+                         static_cast<int64_t>(col) * DK;
+
+  float s[kRegs];
+#pragma unroll
+  for (int i = 0; i < kRegs; ++i) s[i] = __ldcs(p.state + st_off + lane + i * 32);
+
+  const float bias = p.dt_bias[hv];
+  const float neg_rate = -__expf(p.a_log[hv]);
+  for (int t = 0; t < p.rows; ++t) {
+    const int64_t tok = tok_base + t;
+    const int64_t gi = tok * p.num_heads_v + hv;
+    float qv[kRegs], kv[kRegs];
+    float nq = 0.0f, nk = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kRegs; ++i) {
+      const int k = lane + i * 32;
+      kv[i] = static_cast<float>(p.k[tok * k_stride + hk * DK + k]);
+      qv[i] = static_cast<float>(p.q[tok * q_stride + hq * DK + k]);
+      nq += qv[i] * qv[i];
+      nk += kv[i] * kv[i];
+    }
+    const float rq = rsqrtf(GdnWarpReduce(nq) + 1e-12f);
+    const float rk = rsqrtf(GdnWarpReduce(nk) + 1e-12f);
+#pragma unroll
+    for (int i = 0; i < kRegs; ++i) {
+      qv[i] *= rq;
+      kv[i] *= rk;
+    }
+    const float decay_scalar = __expf(neg_rate * GdnSoftPlus(p.decay[gi] + bias));
+    const float beta_t = GdnSigmoid(p.beta[gi]);
+    const float vv = static_cast<float>(p.v[tok * v_stride + hv * p.d_v + col]);
+#pragma unroll
+    for (int i = 0; i < kRegs; ++i) s[i] *= decay_scalar;
+
+    float r = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kRegs; ++i) r += s[i] * kv[i];
+    r = GdnWarpReduce(r);
+
+    const float delta = beta_t * (vv - r);
+
+    float o = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kRegs; ++i) {
+      s[i] += kv[i] * delta;
+      o += s[i] * qv[i];
+    }
+    o = GdnWarpReduce(o);
+    if (lane == 0) p.out[tok * v_stride + hv * p.d_v + col] = static_cast<bf16>(p.scale * o);
+    if (t < 3 && t + 1 < p.rows && p.mid_state[t] != nullptr) {
+#pragma unroll
+      for (int i = 0; i < kRegs; ++i) __stcs(p.mid_state[t] + st_off + lane + i * 32, s[i]);
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < kRegs; ++i) __stcs(p.final_state + st_off + lane + i * 32, s[i]);
+}
+
 // ---------------------------------------------------------------------------------------------
 // PleMidState: the PLE conv state ([B,C,W], bf16, oldest first) and the PLE context ([B,2] int64: previous
 // token ids) after row m (m in {0, 1, 2}) of an R-row call.
@@ -466,9 +604,9 @@ struct GdnRecurrentState {
       const auto ks = Shape(c.GetInput(1));
       const auto vs = Shape(c.GetInput(2));
       const auto ss = Shape(c.GetInput(6));
-      if (qs.size() != 4 || ks.size() != 4 || vs.size() != 4 || ss.size() != 4 || qs[1] < 1 || qs[1] > kMaxRows ||
+      if (qs.size() != 4 || ks.size() != 4 || vs.size() != 4 || ss.size() != 4 || qs[1] < 1 ||
           qs[3] != kGdnDK || ks[3] != kGdnDK || vs[3] != kGdnDK || ss[2] != kGdnDK || ss[3] != kGdnDK) {
-        throw std::invalid_argument("GdnRecurrent: expected q,k [B,R,Hq,128], v [B,R,Hv,128], state [B,Hv,128,128], R in {1,2}");
+        throw std::invalid_argument("GdnRecurrent: expected q,k [B,R,Hq,128], v [B,R,Hv,128], state [B,Hv,128,128], R >= 1");
       }
       const int64_t batch = qs[0], rows = qs[1], hq = qs[2], hk = ks[2], hv = vs[2];
       if (ks[0] != batch || ks[1] != rows || vs[0] != batch || vs[1] != rows || ss[0] != batch || ss[1] != hv ||
@@ -501,8 +639,10 @@ struct GdnRecurrentState {
         GdnRecurrentKernel<2><<<grid, dim3(32, kGdnWarps, 1), 0, Stream(api, raw)>>>(p);
       } else if (rows == 3) {
         GdnRecurrentKernel<3><<<grid, dim3(32, kGdnWarps, 1), 0, Stream(api, raw)>>>(p);
-      } else {
+      } else if (rows == 4) {
         GdnRecurrentKernel<4><<<grid, dim3(32, kGdnWarps, 1), 0, Stream(api, raw)>>>(p);
+      } else {
+        GdnRecurrentMultiRowKernel<<<grid, dim3(32, kGdnWarps, 1), 0, Stream(api, raw)>>>(p);
       }
       CheckLaunch();
       return nullptr;
@@ -572,8 +712,8 @@ struct GdnPrepState {
       auto in0 = Shape(c.GetInput(0));
       auto state_shape = Shape(c.GetInput(1));
       const size_t state_idx = 1, weight_idx = 2;
-      if (in0.size() != 3 || in0[1] < 1 || in0[1] > kMaxRows || state_shape.size() != 3 || state_shape[2] != 4) {
-        throw std::invalid_argument("GdnPrep: expected [B,R,*] activations (R in {1,2}) and state [B,C,4]");
+      if (in0.size() != 3 || in0[1] < 1 || state_shape.size() != 3 || state_shape[2] != 4) {
+        throw std::invalid_argument("GdnPrep: expected [B,R,*] activations (R >= 1) and state [B,C,4]");
       }
       const int64_t batch = in0[0], rows = in0[1], channels = state_shape[1];
       const int64_t tokens = batch * rows;
@@ -636,8 +776,10 @@ struct GdnPrepState {
         GdnPrepKernel<2><<<(total + 255) / 256, 256, 0, Stream(api, raw)>>>(p);
       } else if (rows == 3) {
         GdnPrepKernel<3><<<(total + 255) / 256, 256, 0, Stream(api, raw)>>>(p);
-      } else {
+      } else if (rows == 4) {
         GdnPrepKernel<4><<<(total + 255) / 256, 256, 0, Stream(api, raw)>>>(p);
+      } else {
+        GdnPrepMultiRowKernel<<<(total + 255) / 256, 256, 0, Stream(api, raw)>>>(p);
       }
       CheckLaunch();
       return nullptr;
@@ -678,7 +820,7 @@ struct QkNormRopeState {
       Ort::KernelContext c(raw);
       auto s0 = Shape(c.GetInput(0));
       const int64_t seq = s0.size() == 3 ? s0[1] : 1;
-      if (seq < 1 || seq > kMaxRows) throw std::invalid_argument("QkNormRope: rows per call must be 1 or 2");
+      if (seq < 1) throw std::invalid_argument("QkNormRope: rows per call must be >= 1");
       const int64_t out_batch = s0[0];
       const int64_t batch = s0[0] * seq;  // tokens: rows are independent work items
       const size_t w0 = kMerged ? 1 : 2;  // index of q_w

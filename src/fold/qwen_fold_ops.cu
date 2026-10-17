@@ -91,12 +91,13 @@ __global__ void FoldMidKernel(const i64* tok01, const i64* input_ids, const int*
 __global__ void FoldMid2Kernel(const i64* tok01, const i64* input_ids, const int* status, int nst, i64* ctl, i64* ctx_commit,
                                const i64* ctx_a, const i64* ctx_b, const i64* ptrs, const unsigned short* cos_cache,
                                const unsigned short* sin_cache, i64* head_ids, int* head_c, i64* slot_ids, int* seqlens,
-                               unsigned short* cos_out, unsigned short* sin_out, i64* sel, int rows) {
-  const i64 L = ctl[1];
-  const i64 c = ctl[7];
-  if (threadIdx.x >= 32) {  // rope rows for positions L+1 .. L+rows (32 bf16 each)
+                               unsigned short* cos_out, unsigned short* sin_out, i64* sel, int rows, int head_rows) {
+  const bool muted = (ctl[3] != 0);
+  const i64 L = muted ? 0 : ctl[1];
+  const i64 c = muted ? 0 : ctl[7];
+  if (threadIdx.x >= 32) {  // rope rows for positions L+1 .. L+head_rows (32 bf16 each)
     const int j = threadIdx.x - 32;
-    if (j < 32 * rows) {
+    if (j < 32 * head_rows) {
       const i64 pos = L + 1 + (j >> 5);
       cos_out[j] = cos_cache[pos * 32 + (j & 31)];
       sin_out[j] = sin_cache[pos * 32 + (j & 31)];
@@ -105,7 +106,8 @@ __global__ void FoldMid2Kernel(const i64* tok01, const i64* input_ids, const int
   }
   if (threadIdx.x != 0) return;
   int a = 0;
-  for (int j = 0; j + 1 < rows; ++j) {
+  const int check_rows = rows <= 4 ? rows : head_rows;
+  for (int j = 0; j + 1 < check_rows; ++j) {
     if (tok01[j] == input_ids[j + 1]) {
       ++a;
     } else {
@@ -114,13 +116,14 @@ __global__ void FoldMid2Kernel(const i64* tok01, const i64* input_ids, const int
   }
   i64 st = 0;
   for (int k = 0; k < nst; ++k) st |= static_cast<i64>(status[k]);
-  for (int j = 0; j < rows; ++j) {
-    head_ids[j] = (j < a) ? input_ids[j + 1] : tok01[j];
+  for (int j = 0; j < head_rows; ++j) {
+    const int src_j = j < rows ? j : (rows - 1);
+    head_ids[j] = (j < a && j + 1 < rows) ? input_ids[j + 1] : tok01[src_j];
     slot_ids[j] = c + j;
   }
   head_c[0] = static_cast<int>(c);
-  seqlens[0] = static_cast<int>(c) + rows - 1;
-  sel[0] = a;
+  seqlens[0] = static_cast<int>(c) + head_rows - 1;
+  sel[0] = a < head_rows ? a : 0;
   if (ctl[3] != 0) return;
   const i64 step = a + 1;
   const i64* src = (a == 0) ? ctx_a : (a == 1 ? ctx_b : (ctx_a + 2 * a));
@@ -134,10 +137,10 @@ __global__ void FoldMid2Kernel(const i64* tok01, const i64* input_ids, const int
   ctl[1] = L + step;
   ctl[7] = c + step;
   ctl[4] += 1;
-  ctl[5] |= (st ? 2 : 0) | ((c + rows > kHeadCapacity) ? 4 : 0);
+  ctl[5] |= (st ? 2 : 0) | ((c + head_rows > kHeadCapacity) ? 4 : 0);
   ctl[6] = a;
   r[1] = tok01[0];
-  r[2] = tok01[1];
+  r[2] = rows >= 2 ? tok01[1] : tok01[0];
   r[3] = a;
   r[4] = st;
   r[5] = new_pending;
@@ -151,13 +154,36 @@ __global__ void FoldMid2Kernel(const i64* tok01, const i64* input_ids, const int
   r[0] = ctl[4];
 }
 
+__global__ void CopyHeadHiddenKernel(const unsigned short* src, unsigned short* dst, int src_rows, int dst_rows, int width) {
+  const int64_t total = static_cast<int64_t>(dst_rows) * width;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
+       idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int r = static_cast<int>(idx / width);
+    const int c = static_cast<int>(idx % width);
+    const int sr = r < src_rows ? r : (src_rows - 1);
+    dst[idx] = src[static_cast<int64_t>(sr) * width + c];
+  }
+}
+
 // EmbedNorm: Gather(embed) + RMSNorm in one kernel, bit-identical to the ORT op chain at R=1 (Gather, Cast, Mul, ReduceMean, Add, Sqrt,
 // Reciprocal, Mul, Mul, Cast): the fp32 sum of squares follows ORT's reduce_matrix_rows_kernel for [2560] (block of 512 threads: thread t sums
 // x[t], x[t+512], ..., x[t+2048] in this order, then the halving tree s[t] += s[t+256], ... s[t] += s[t+1]); mean = sum / N; + eps; sqrt; 1/s;
 // x * r; * w; bf16.  One block per row.  (The ORT chain at R=2 uses a different reduction order, reduce_matrix_columns_kernel: the R=1 order is
 // kept for every row so that the head's rows equal the single-row chains of the reference head.)
-__global__ void EmbedNormKernel(const i64* ids, const unsigned short* table, const float* w, float eps, unsigned short* out, int n) {
+__global__ void EmbedNormKernel(const i64* ids, const unsigned short* table, const float* w, float eps, unsigned short* out, int n,
+                                const int* committed, i64* slot_ids, int* seqlens_k, int* cu_seqlens, int rows) {
   __shared__ float s[512];
+  if (threadIdx.x == 0 && committed != nullptr) {
+    const int c = committed[0];
+    if (slot_ids != nullptr) slot_ids[blockIdx.x] = static_cast<i64>(c) + static_cast<i64>(blockIdx.x);
+    if (blockIdx.x == 0) {
+      if (seqlens_k != nullptr) seqlens_k[0] = c + rows - 1;
+      if (cu_seqlens != nullptr) {
+        cu_seqlens[0] = 0;
+        cu_seqlens[1] = rows;
+      }
+    }
+  }
   const i64 tok = ids[blockIdx.x];
   const unsigned short* row = table + tok * n;
   float acc = 0.f;
@@ -286,7 +312,14 @@ struct MidState {
 
 struct Mid2State {
   const OrtApi& api;
-  Mid2State(const OrtApi& a, const OrtKernelInfo*) : api(a) {}
+  int fixed_head_rows = 2;
+  Mid2State(const OrtApi& a, const OrtKernelInfo* info) : api(a) {
+    try {
+      Ort::ConstKernelInfo k(info);
+      fixed_head_rows = static_cast<int>(k.GetAttribute<int64_t>("head_rows"));
+    } catch (const std::exception&) {
+    }
+  }
   OrtStatus* ComputeV2(OrtKernelContext* raw) noexcept {
     try {
       Ort::KernelContext c(raw);
@@ -302,15 +335,17 @@ struct Mid2State {
       auto sin_cache = c.GetInput(9);
       const int nst = static_cast<int>(status.GetTensorTypeAndShapeInfo().GetElementCount());
       const int64_t rows = tok.GetTensorTypeAndShapeInfo().GetElementCount();
-      if (rows < 2 || rows > 4) throw std::invalid_argument("FoldMid2: rows must be in [2, 4]");
-      auto head_ids = c.GetOutput(0, std::vector<int64_t>{1, rows});
+      if (rows < 1) throw std::invalid_argument("FoldMid2: rows must be >= 1");
+      const int64_t head_rows = (rows >= 2 && rows <= 4) ? rows : fixed_head_rows;
+      auto head_ids = c.GetOutput(0, std::vector<int64_t>{1, head_rows});
       auto head_c = c.GetOutput(1, std::vector<int64_t>{1});
-      auto slot_ids = c.GetOutput(2, std::vector<int64_t>{1, rows});
+      auto slot_ids = c.GetOutput(2, std::vector<int64_t>{1, head_rows});
       auto seqlens = c.GetOutput(3, std::vector<int64_t>{1});
-      auto cos_out = c.GetOutput(4, std::vector<int64_t>{1, rows, 32});
-      auto sin_out = c.GetOutput(5, std::vector<int64_t>{1, rows, 32});
+      auto cos_out = c.GetOutput(4, std::vector<int64_t>{1, head_rows, 32});
+      auto sin_out = c.GetOutput(5, std::vector<int64_t>{1, head_rows, 32});
       auto sel = c.GetOutput(6, std::vector<int64_t>{1});
-      FoldMid2Kernel<<<1, static_cast<unsigned>(32 * (rows + 1)), 0, Stream(api, raw)>>>(
+      cudaStream_t stream = Stream(api, raw);
+      FoldMid2Kernel<<<1, static_cast<unsigned>(32 * (head_rows + 1)), 0, stream>>>(
           tok.GetTensorData<i64>(), ids.GetTensorData<i64>(), status.GetTensorData<int>(), nst,
           const_cast<i64*>(ctl.GetTensorData<i64>()), const_cast<i64*>(ctx_commit.GetTensorData<i64>()),
           ctx_a.GetTensorData<i64>(), ctx_b.GetTensorData<i64>(), ptrs.GetTensorData<i64>(),
@@ -319,7 +354,34 @@ struct Mid2State {
           head_ids.GetTensorMutableData<i64>(), head_c.GetTensorMutableData<int>(), slot_ids.GetTensorMutableData<i64>(),
           seqlens.GetTensorMutableData<int>(), reinterpret_cast<unsigned short*>(cos_out.GetTensorMutableData<Ort::BFloat16_t>()),
           reinterpret_cast<unsigned short*>(sin_out.GetTensorMutableData<Ort::BFloat16_t>()), sel.GetTensorMutableData<i64>(),
-          static_cast<int>(rows));
+          static_cast<int>(rows), static_cast<int>(head_rows));
+      if (c.GetInputCount() > 10 && c.GetOutputCount() > 7) {
+        const OrtValue* v_in = nullptr;
+        Ort::ThrowOnError(api.KernelContext_GetInput(raw, 10, &v_in));
+        if (v_in != nullptr) {
+          Ort::ConstValue h_in(v_in);
+          auto h_shape = h_in.GetTensorTypeAndShapeInfo().GetShape();
+          const int width = static_cast<int>(h_shape.back());
+          const std::vector<int64_t> out_h_shape = {1, head_rows, width};
+          OrtValue* v_out = nullptr;
+          Ort::ThrowOnError(api.KernelContext_GetOutput(raw, 7, out_h_shape.data(), out_h_shape.size(), &v_out));
+          if (v_out != nullptr) {
+            const void* src_p = nullptr;
+            void* dst_p = nullptr;
+            Ort::ThrowOnError(api.GetTensorData(v_in, &src_p));
+            Ort::ThrowOnError(api.GetTensorMutableData(v_out, &dst_p));
+            if (rows == head_rows) {
+              cudaMemcpyAsync(dst_p, src_p, static_cast<size_t>(head_rows) * width * sizeof(unsigned short),
+                              cudaMemcpyDeviceToDevice, stream);
+            } else {
+              const int blocks = static_cast<int>((head_rows * width + 255) / 256);
+              CopyHeadHiddenKernel<<<blocks, 256, 0, stream>>>(
+                  static_cast<const unsigned short*>(src_p), static_cast<unsigned short*>(dst_p),
+                  static_cast<int>(rows), static_cast<int>(head_rows), width);
+            }
+          }
+        }
+      }
       CheckLaunch();
       return nullptr;
     } catch (const std::exception& e) {
@@ -348,9 +410,35 @@ struct EmbedNormState {
       std::vector<int64_t> oshape = ishape;
       oshape.push_back(n);
       auto out = c.GetOutput(0, oshape);
+      const int* committed_ptr = nullptr;
+      i64* slot_ids_ptr = nullptr;
+      int* seqlens_k_ptr = nullptr;
+      int* cu_seqlens_ptr = nullptr;
+      if (c.GetInputCount() > 3) {
+        const OrtValue* vc = nullptr;
+        Ort::ThrowOnError(api.KernelContext_GetInput(raw, 3, &vc));
+        if (vc != nullptr) {
+          const void* p = nullptr;
+          Ort::ThrowOnError(api.GetTensorData(vc, &p));
+          committed_ptr = static_cast<const int*>(p);
+        }
+      }
+      auto opt_out = [&](size_t idx, const std::vector<int64_t>& sh) -> void* {
+        if (idx >= c.GetOutputCount()) return nullptr;
+        OrtValue* vo = nullptr;
+        Ort::ThrowOnError(api.KernelContext_GetOutput(raw, idx, sh.data(), sh.size(), &vo));
+        if (vo == nullptr) return nullptr;
+        void* p = nullptr;
+        Ort::ThrowOnError(api.GetTensorMutableData(vo, &p));
+        return p;
+      };
+      slot_ids_ptr = static_cast<i64*>(opt_out(1, {1, rows}));
+      seqlens_k_ptr = static_cast<int*>(opt_out(2, {1}));
+      cu_seqlens_ptr = static_cast<int*>(opt_out(3, {2}));
       EmbedNormKernel<<<rows, 512, 0, Stream(api, raw)>>>(
           ids.GetTensorData<i64>(), reinterpret_cast<const unsigned short*>(table.GetTensorData<Ort::BFloat16_t>()),
-          w.GetTensorData<float>(), eps, reinterpret_cast<unsigned short*>(out.GetTensorMutableData<Ort::BFloat16_t>()), n);
+          w.GetTensorData<float>(), eps, reinterpret_cast<unsigned short*>(out.GetTensorMutableData<Ort::BFloat16_t>()), n,
+          committed_ptr, slot_ids_ptr, seqlens_k_ptr, cu_seqlens_ptr, rows);
       CheckLaunch();
       return nullptr;
     } catch (const std::exception& e) {
@@ -518,15 +606,26 @@ struct MidOp : FoldOp<MidOp, MidState> {
   const char* GetName() const { return "FoldMid"; }
 };
 struct Mid2Op : FoldOp<Mid2Op, Mid2State> {
-  static constexpr std::array<ONNXTensorElementDataType, 10> kIn = {kI64, kI64, kI32, kI64, kI64, kI64, kI64, kI64, kBF, kBF};
-  static constexpr std::array<ONNXTensorElementDataType, 7> kOut = {kI64, kI32, kI64, kI32, kBF, kBF, kI64};
+  static constexpr std::array<ONNXTensorElementDataType, 11> kIn = {kI64, kI64, kI32, kI64, kI64, kI64, kI64, kI64, kBF, kBF, kBF};
+  static constexpr std::array<ONNXTensorElementDataType, 8> kOut = {kI64, kI32, kI64, kI32, kBF, kBF, kI64, kBF};
   const char* GetName() const { return "FoldMid2"; }
+  OrtCustomOpInputOutputCharacteristic GetInputCharacteristic(size_t i) const {
+    return i >= 10 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
+  }
+  OrtCustomOpInputOutputCharacteristic GetOutputCharacteristic(size_t i) const {
+    return i >= 7 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
+  }
 };
 struct EmbedNormOp : FoldOp<EmbedNormOp, EmbedNormState> {
-  static constexpr std::array<ONNXTensorElementDataType, 3> kIn = {kI64, kBF, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT};
-  static constexpr std::array<ONNXTensorElementDataType, 1> kOut = {kBF};
+  static constexpr std::array<ONNXTensorElementDataType, 4> kIn = {kI64, kBF, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, kI32};
+  static constexpr std::array<ONNXTensorElementDataType, 4> kOut = {kBF, kI64, kI32, kI32};
   const char* GetName() const { return "EmbedNorm"; }
-  // epsilon attribute: float
+  OrtCustomOpInputOutputCharacteristic GetInputCharacteristic(size_t i) const {
+    return i >= 3 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
+  }
+  OrtCustomOpInputOutputCharacteristic GetOutputCharacteristic(size_t i) const {
+    return i >= 1 ? INPUT_OUTPUT_OPTIONAL : INPUT_OUTPUT_REQUIRED;
+  }
 };
 struct RowSelectOp : FoldOp<RowSelectOp, RowSelectState> {
   static constexpr std::array<ONNXTensorElementDataType, 4> kIn = {kI64, kBF, kBF, kBF};

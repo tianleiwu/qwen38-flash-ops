@@ -51,11 +51,14 @@ function(qwen38_add_op_library NAME ARCH_SUFFIX)
   set(QWEN38_OP_LIBRARIES ${QWEN38_OP_LIBRARIES} PARENT_SCOPE)
 endfunction()
 
+find_package(CUDAToolkit REQUIRED)
+
 qwen38_add_op_library(qwen_fused_ops    ""  src/fused_ops/fused_ops.cu)             # domain qwen.fused
 qwen38_add_op_library(qwen_fused_attn_r5 a  src/fused_attn/fused_attn_r5.cu)        # domain qwen.fused_attn
 qwen38_add_op_library(qwen_fused_hc_r5  ""  src/fused_hc/fused_hc_r5.cu)            # domain qwen.fused_hc
 qwen38_add_op_library(qwen_fused_gemm_r5 "" src/fused_gemm/fused_gemm.cu)           # domain qwen.fused_gemm
 target_include_directories(qwen_fused_gemm_r5 PRIVATE src/fused_gemm)
+target_link_libraries(qwen_fused_gemm_r5 PRIVATE CUDA::cublas)
 qwen38_add_op_library(qwen_fold         ""  src/fold/qwen_fold_ops.cu)              # domain qwen.fold
 qwen38_add_op_library(qwen_mtp_head     ""  src/mtp_head/qwen_mtp_ops.cu)           # domain qwen.mtp
 

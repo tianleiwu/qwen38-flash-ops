@@ -64,6 +64,7 @@ set(ORT_PRIVATE_INCLUDES
 set(ORT_PRIVATE_SYSTEM_INCLUDES
   "${CUDA_ROOT}/targets/x86_64-linux/include"
   "${CUDA_ROOT}/targets/x86_64-linux/include/cccl"
+  "$ENV{HOME}/cudnn_9.23_cuda13/include"
   "${DEP_SAFEINT}" "${DEP_GSL}/include" "${DEP_CUDNNFE}/include" "${DEP_MP11}/include")
 
 # Compile definitions and nvcc flags of ORT's onnxruntime_providers_cuda_plugin target (the build these forks were developed against).

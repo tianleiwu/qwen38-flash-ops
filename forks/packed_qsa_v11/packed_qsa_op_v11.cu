@@ -51,6 +51,27 @@ std::string ShapeString(const std::vector<int64_t>& shape) {
   return stream.str();
 }
 
+struct SharedQsaPrefillWorkspace {
+  std::mutex mu;
+  float* ptr = nullptr;
+  size_t count = 0;
+  float* Ensure(size_t needed) {
+    if (needed > count) {
+      if (ptr) cudaFree(ptr);
+      ptr = nullptr;
+      count = 0;
+      CheckCuda(cudaMalloc(&ptr, needed * sizeof(float)));
+      count = needed;
+    }
+    return ptr;
+  }
+};
+
+SharedQsaPrefillWorkspace& GetSharedQsaPrefillWorkspace() {
+  static SharedQsaPrefillWorkspace ws;
+  return ws;
+}
+
 struct PackedQsaKernel {
   const OrtApi& api;
   int compress_ratio;
@@ -62,6 +83,7 @@ struct PackedQsaKernel {
   float epsilon;
   float scale;
   float* workspace = nullptr;
+  size_t workspace_floats = 0;
   int instance_id;
 
   PackedQsaKernel(const OrtApi& supplied, const OrtKernelInfo* info) : api(supplied) {
@@ -78,14 +100,14 @@ struct PackedQsaKernel {
     scale = metadata.GetAttribute<float>("scale");
     if (compress_ratio <= 0 || state_capacity <= 0 || token_budget <= 0 ||
         token_budget % compress_ratio != 0 || num_heads <= 0 ||
-        head_size <= 0 || max_tokens < 1 || max_tokens > 128 ||
+        head_size <= 0 || max_tokens < 1 || max_tokens > 4096 ||
         !std::isfinite(epsilon) || epsilon < 0 ||
         !std::isfinite(scale) || scale <= 0) {
       throw std::invalid_argument("PackedQSAIndexer: invalid attributes");
     }
     packed::PackedSparseAttentionIndexerParams params;
     params.batch_size = 1;
-    params.total_tokens = max_tokens;
+    params.total_tokens = std::min(max_tokens, 128);
     params.num_heads = num_heads;
     params.head_size = head_size;
     params.query_row_stride = (num_heads + 1) * head_size;
@@ -100,9 +122,8 @@ struct PackedQsaKernel {
     params.epsilon = epsilon;
     params.scale = scale;
     params.block_topk = token_budget / compress_ratio;
-    const size_t workspace_count =
-        packed::GetQsaPackedWorkspaceFloatCount(params);
-    CheckCuda(cudaMalloc(&workspace, workspace_count * sizeof(float)));
+    workspace_floats = packed::GetQsaPackedWorkspaceFloatCount(params);
+    CheckCuda(cudaMalloc(&workspace, workspace_floats * sizeof(float)));
   }
 
   ~PackedQsaKernel() {
@@ -124,7 +145,7 @@ struct PackedQsaKernel {
       const auto query_shape =
           context.GetInput(0).GetTensorTypeAndShapeInfo().GetShape();
       if (query_shape.size() != 2 || query_shape[0] < 1 ||
-          query_shape[0] > max_tokens ||
+          query_shape[0] > 4096 ||
           query_shape[1] != (num_heads + 1) * head_size) {
         throw std::invalid_argument("PackedQSAIndexer: invalid query");
       }
@@ -239,6 +260,13 @@ struct PackedQsaKernel {
             total_tokens);
         std::fflush(stderr);
       }
+      float* active_ws = workspace;
+      const size_t needed_floats = packed::GetQsaPackedWorkspaceFloatCount(params);
+      if (needed_floats > workspace_floats) {
+        auto& sws = GetSharedQsaPrefillWorkspace();
+        std::lock_guard<std::mutex> lock(sws.mu);
+        active_ws = sws.Ensure(needed_floats);
+      }
       auto status = packed::LaunchQsaPackedSparseAttentionIndexer<__nv_bfloat16>(
           stream,
           params,
@@ -263,7 +291,7 @@ struct PackedQsaKernel {
               present_buffer.GetTensorMutableData<Ort::BFloat16_t>()),
           present_lengths.GetTensorMutableData<int32_t>(),
           nullptr,
-          workspace,
+          active_ws,
           validation_status.GetTensorMutableData<int32_t>());
       if (!status.IsOK()) {
         return api.CreateStatus(ORT_FAIL, status.ErrorMessage().c_str());

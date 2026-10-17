@@ -104,6 +104,79 @@ def test_sigmoid_gate_mul(lib):
     ref = (attn.float().view(tokens, heads, head_dim) * torch.sigmoid(gate).bfloat16().float()).bfloat16().view(tokens, -1)
     assert bf16_ulp_close(out, ref), "SigmoidGateMul differs from the reference"
 
+    # Also test GdnProjPrep, GdnRecurrent, and QsaProjPrep at rows=12 (prefill dispatch) vs 12 x rows=1 (decode dispatch)
+    R_pre = 12
+    C, Q_sz, K_sz, Hv, Z_sz = 128, 32, 32, 4, 64
+    N_gdn = C + Z_sz + 2 * Hv
+    m_in = (torch.randn(1, R_pre, N_gdn, generator=gen, device="cuda") * 0.2).bfloat16()
+    c_st0 = (torch.randn(1, C, 4, generator=gen, device="cuda") * 0.2).bfloat16()
+    c_w = (torch.randn(C, 1, 4, generator=gen, device="cuda") * 0.2).bfloat16()
+    gdn_attrs = dict(q_size=Q_sz, k_size=K_sz, off_qkv=0, off_z=C, z_size=Z_sz, off_b=C + Z_sz, off_a=C + Z_sz + Hv, heads=Hv)
+    sess_gprep = make_session(lib, "qwen.fused_attn", "GdnProjPrep",
+                              [("m", BF, [1, None, N_gdn]), ("st", BF, [1, C, 4]), ("w", BF, [C, 1, 4])],
+                              [("q", BF, None), ("k", BF, None), ("v", BF, None), ("z", BF, None),
+                               ("so", BF, [1, C, 4]), ("b32", F32, None), ("a32", F32, None)], **gdn_attrs)
+    out_pre = run(sess_gprep, {"m": m_in, "st": c_st0, "w": c_w},
+                  {"q": (torch.bfloat16, [1, R_pre, Q_sz]), "k": (torch.bfloat16, [1, R_pre, K_sz]),
+                   "v": (torch.bfloat16, [1, R_pre, C - Q_sz - K_sz]), "z": (torch.bfloat16, [1, R_pre, Z_sz]),
+                   "so": (torch.bfloat16, [1, C, 4]), "b32": (torch.float32, [1, R_pre, Hv]), "a32": (torch.float32, [1, R_pre, Hv])})
+    st_cur = c_st0.clone()
+    qs_1 = []
+    for r in range(R_pre):
+        o1 = run(sess_gprep, {"m": m_in[:, r:r+1, :].contiguous(), "st": st_cur, "w": c_w},
+                 {"q": (torch.bfloat16, [1, 1, Q_sz]), "k": (torch.bfloat16, [1, 1, K_sz]),
+                  "v": (torch.bfloat16, [1, 1, C - Q_sz - K_sz]), "z": (torch.bfloat16, [1, 1, Z_sz]),
+                  "so": (torch.bfloat16, [1, C, 4]), "b32": (torch.float32, [1, 1, Hv]), "a32": (torch.float32, [1, 1, Hv])})
+        st_cur = o1["so"]
+        qs_1.append(o1["q"])
+    assert torch.equal(out_pre["q"], torch.cat(qs_1, dim=1)) and torch.equal(out_pre["so"], st_cur), "GdnProjPrep prefill mismatch"
+
+    # GdnRecurrent at rows=12 vs 12 x rows=1
+    Hq_r, Hk_r, Hv_r, DK = 2, 2, 4, 128
+    q_r = (torch.randn(1, R_pre, Hq_r, DK, generator=gen, device="cuda") * 0.2).bfloat16()
+    k_r = (torch.randn(1, R_pre, Hk_r, DK, generator=gen, device="cuda") * 0.2).bfloat16()
+    v_r = (torch.randn(1, R_pre, Hv_r, DK, generator=gen, device="cuda") * 0.2).bfloat16()
+    dec_r = torch.randn(1, R_pre, Hv_r, generator=gen, device="cuda", dtype=torch.float32) * 0.1
+    bet_r = torch.randn(1, R_pre, Hv_r, generator=gen, device="cuda", dtype=torch.float32) * 0.1
+    st_r0 = torch.randn(1, Hv_r, DK, DK, generator=gen, device="cuda", dtype=torch.float32) * 0.05
+    alog = torch.randn(Hv_r, generator=gen, device="cuda", dtype=torch.float32) * 0.1
+    dt_b = torch.randn(Hv_r, generator=gen, device="cuda", dtype=torch.float32) * 0.1
+    sess_grec = make_session(lib, "qwen.fused_attn", "GdnRecurrent",
+                             [("q", BF, [1, None, Hq_r, DK]), ("k", BF, [1, None, Hk_r, DK]), ("v", BF, [1, None, Hv_r, DK]),
+                              ("", BF, None), ("dec", F32, [1, None, Hv_r]), ("bet", F32, [1, None, Hv_r]),
+                              ("st", F32, [1, Hv_r, DK, DK]), ("alog", F32, [Hv_r]), ("dtb", F32, [Hv_r])],
+                             [("o", BF, None), ("fs", F32, [1, Hv_r, DK, DK])],
+                             update_rule="gated_delta", gate_activation="qwen", beta_activation="sigmoid", qk_l2_norm=1, scale=0.0883883476)
+    node_grec = sess_grec
+    # Run via IOBinding (input 3 is optional empty)
+    def run_grec(q_t, k_t, v_t, d_t, b_t, s_t):
+        R_cur = q_t.shape[1]
+        b = node_grec.io_binding()
+        b.bind_input("q", "cuda", 0, ORT_ELEM[BF], [1, R_cur, Hq_r, DK], q_t.data_ptr())
+        b.bind_input("k", "cuda", 0, ORT_ELEM[BF], [1, R_cur, Hk_r, DK], k_t.data_ptr())
+        b.bind_input("v", "cuda", 0, ORT_ELEM[BF], [1, R_cur, Hv_r, DK], v_t.data_ptr())
+        b.bind_input("dec", "cuda", 0, ORT_ELEM[F32], [1, R_cur, Hv_r], d_t.data_ptr())
+        b.bind_input("bet", "cuda", 0, ORT_ELEM[F32], [1, R_cur, Hv_r], b_t.data_ptr())
+        b.bind_input("st", "cuda", 0, ORT_ELEM[F32], [1, Hv_r, DK, DK], s_t.data_ptr())
+        b.bind_input("alog", "cuda", 0, ORT_ELEM[F32], [Hv_r], alog.data_ptr())
+        b.bind_input("dtb", "cuda", 0, ORT_ELEM[F32], [Hv_r], dt_b.data_ptr())
+        o_t = torch.empty((1, R_cur, Hv_r, DK), dtype=torch.bfloat16, device="cuda")
+        fs_t = torch.empty((1, Hv_r, DK, DK), dtype=torch.float32, device="cuda")
+        b.bind_output("o", "cuda", 0, ORT_ELEM[BF], [1, R_cur, Hv_r, DK], o_t.data_ptr())
+        b.bind_output("fs", "cuda", 0, ORT_ELEM[F32], [1, Hv_r, DK, DK], fs_t.data_ptr())
+        node_grec.run_with_iobinding(b)
+        torch.cuda.synchronize()
+        return o_t, fs_t
+
+    o_pre, fs_pre = run_grec(q_r, k_r, v_r, dec_r, bet_r, st_r0)
+    s_cur = st_r0.clone()
+    os_1 = []
+    for r in range(R_pre):
+        o1, s_cur = run_grec(q_r[:, r:r+1].contiguous(), k_r[:, r:r+1].contiguous(), v_r[:, r:r+1].contiguous(),
+                             dec_r[:, r:r+1].contiguous(), bet_r[:, r:r+1].contiguous(), s_cur)
+        os_1.append(o1)
+    assert torch.equal(o_pre, torch.cat(os_1, dim=1)) and torch.equal(fs_pre, s_cur), "GdnRecurrent prefill mismatch"
+
 
 def test_swish_mul(lib):
     gen = torch.Generator(device="cuda").manual_seed(2)
@@ -282,6 +355,52 @@ def test_skinny_gemm_and_dequant_and_untile(lib):
     y_ref = (x.float() @ ref_deq.float()).bfloat16()
     assert ((y_fp8.float() - y_ref.float()).norm() / y_ref.float().norm()).item() < 0.01, "SkinnyGemm FP8 error too high"
 
+    # SkinnyGemm FP8 at M=16 (prefill cublasGemmEx path)
+    x16 = torch.randn(1, 16, K, generator=gen, device="cuda").bfloat16()
+    sess_fp8_16 = make_session(lib, "qwen.fused_gemm", "SkinnyGemm", [("x", BF, [1, 16, K]), ("w", FP8, [K, N])],
+                               [("o0", BF, [1, 16, 64]), ("o1", BF, [1, 16, 64])], seg_outs=[2], widths=widths, w_scale=w_scale)
+    b16 = sess_fp8_16.io_binding()
+    b16.bind_input("x", "cuda", 0, ORT_ELEM[BF], [1, 16, K], x16.data_ptr())
+    b16.bind_input("w", "cuda", 0, ORT_ELEM[FP8], [K, N], w_fp8.view(torch.uint8).data_ptr())
+    o0_16 = torch.empty((1, 16, 64), dtype=torch.bfloat16, device="cuda")
+    o1_16 = torch.empty((1, 16, 64), dtype=torch.bfloat16, device="cuda")
+    b16.bind_output("o0", "cuda", 0, ORT_ELEM[BF], [1, 16, 64], o0_16.data_ptr())
+    b16.bind_output("o1", "cuda", 0, ORT_ELEM[BF], [1, 16, 64], o1_16.data_ptr())
+    sess_fp8_16.run_with_iobinding(b16)
+    y_fp8_16 = torch.cat([o0_16, o1_16], dim=-1)
+    y_ref_16 = (x16.float() @ ref_deq.float()).bfloat16()
+    assert bf16_ulp_close(y_fp8_16, y_ref_16), "SkinnyGemm M=16 prefill mismatch"
+
+    # SharedExpertDown FP8 at M=16 (prefill path) vs M=2 chunks (decode path)
+    g16 = (torch.randn(1, 16, K, generator=gen, device="cuda") * 0.2).bfloat16()
+    u16 = (torch.randn(1, 16, K, generator=gen, device="cuda") * 0.2).bfloat16()
+    gx16 = (torch.randn(1, 16, K, generator=gen, device="cuda") * 0.2).bfloat16()
+    gw = (torch.randn(K, 1, generator=gen, device="cuda") * 0.2).bfloat16()
+    routed16 = (torch.randn(1, 16, N, generator=gen, device="cuda") * 0.2).bfloat16()
+    sess_sed = make_session(lib, "qwen.fused_gemm", "SharedExpertDown",
+                            [("g", BF, [1, None, K]), ("u", BF, [1, None, K]), ("w", FP8, [K, N]),
+                             ("gx", BF, [1, None, K]), ("gw", BF, [K, 1]), ("routed", BF, [1, None, N])],
+                            [("out", BF, None)], w_scale=w_scale)
+    def run_sed(M_cur, g_t, u_t, gx_t, r_t):
+        bs = sess_sed.io_binding()
+        bs.bind_input("g", "cuda", 0, ORT_ELEM[BF], [1, M_cur, K], g_t.data_ptr())
+        bs.bind_input("u", "cuda", 0, ORT_ELEM[BF], [1, M_cur, K], u_t.data_ptr())
+        bs.bind_input("w", "cuda", 0, ORT_ELEM[FP8], [K, N], w_fp8.view(torch.uint8).data_ptr())
+        bs.bind_input("gx", "cuda", 0, ORT_ELEM[BF], [1, M_cur, K], gx_t.data_ptr())
+        bs.bind_input("gw", "cuda", 0, ORT_ELEM[BF], [K, 1], gw.data_ptr())
+        bs.bind_input("routed", "cuda", 0, ORT_ELEM[BF], [1, M_cur, N], r_t.data_ptr())
+        out_t = torch.empty((1, M_cur, N), dtype=torch.bfloat16, device="cuda")
+        bs.bind_output("out", "cuda", 0, ORT_ELEM[BF], [1, M_cur, N], out_t.data_ptr())
+        sess_sed.run_with_iobinding(bs)
+        torch.cuda.synchronize()
+        return out_t
+    out_sed_16 = run_sed(16, g16, u16, gx16, routed16)
+    out_sed_2s = torch.cat([run_sed(2, g16[:, i:i+2].contiguous(), u16[:, i:i+2].contiguous(),
+                                    gx16[:, i:i+2].contiguous(), routed16[:, i:i+2].contiguous())
+                            for i in range(0, 16, 2)], dim=1)
+    rel_sed = ((out_sed_16.float() - out_sed_2s.float()).norm() / out_sed_2s.float().norm()).item()
+    assert rel_sed < 0.002, f"SharedExpertDown M=16 prefill vs M=2 decode error too high: {rel_sed}"
+
     # UntileHcBf16 kind=0 ([160, 20480] -> [10240, 320]) BF16 and FP8
     w_orig = torch.randint(0, 30000, (10240, 320), dtype=torch.int16, device="cuda").view(torch.bfloat16)
     w_tiled = w_orig.view(8, 10, 128, 20, 2, 8).permute(0, 3, 1, 2, 4, 5).contiguous().view(160, 20480)
@@ -342,6 +461,29 @@ def test_hc_post_block_fp8(lib):
                   {"so": (torch.bfloat16, [1, 2, 10240]), "pre": (torch.bfloat16, [1, 2, 2560]),
                    "go": (torch.bfloat16, [1, 2, 4]), "scr": (torch.float32, [2, 2992])})
     assert torch.equal(out_bf["so"], out_fp8["so"]) and torch.equal(out_bf["pre"], out_fp8["pre"]) and torch.equal(out_bf["go"], out_fp8["go"])
+
+    # Also test rows=16 (prefill two-phase LaunchDownFp8 + LaunchUpFp8) vs BF16 dequantized weights
+    streams16 = (torch.randn(1, 16, 10240, generator=gen, device="cuda") * 0.2).bfloat16()
+    branch16 = (torch.randn(1, 16, 2560, generator=gen, device="cuda") * 0.2).bfloat16()
+    gate16 = (torch.randn(1, 16, 4, generator=gen, device="cuda") * 0.2).bfloat16()
+    sess_bf16 = make_session(lib, "qwen.fused_hc", "HcPostBlock",
+                             [("s", BF, [1, 16, 10240]), ("br", BF, [1, 16, 2560]), ("g", BF, [1, 16, 4]),
+                              ("nw", BF, [10240]), ("wd", BF, [160, 20480]), ("wi", BF, [10240, 4]), ("wu", BF, [160, 20480])],
+                             [("so", BF, [1, 16, 10240]), ("pre", BF, [1, 16, 2560]), ("go", BF, [1, 16, 4]), ("scr", F32, [16, 2992])],
+                             **attrs)
+    sess_fp8_16 = make_session(lib, "qwen.fused_hc", "HcPostBlock",
+                               [("s", BF, [1, 16, 10240]), ("br", BF, [1, 16, 2560]), ("g", BF, [1, 16, 4]),
+                                ("nw", BF, [10240]), ("wd", FP8, [160, 20480]), ("wi", BF, [10240, 4]), ("wu", FP8, [160, 20480])],
+                               [("so", BF, [1, 16, 10240]), ("pre", BF, [1, 16, 2560]), ("go", BF, [1, 16, 4]), ("scr", F32, [16, 2992])],
+                               wd_scale=wd_sc.cpu().numpy().tolist(), wu_scale=wu_sc.cpu().numpy().tolist(), **attrs)
+    out_bf16 = run(sess_bf16, {"s": streams16, "br": branch16, "g": gate16, "nw": norm_w, "wd": wd_deq_t, "wi": w_inject, "wu": wu_deq_t},
+                   {"so": (torch.bfloat16, [1, 16, 10240]), "pre": (torch.bfloat16, [1, 16, 2560]),
+                    "go": (torch.bfloat16, [1, 16, 4]), "scr": (torch.float32, [16, 2992])})
+    out_fp8_16 = run(sess_fp8_16, {"s": streams16, "br": branch16, "g": gate16, "nw": norm_w,
+                                   "wd": wd_fp8_t.view(torch.float8_e4m3fn), "wi": w_inject, "wu": wu_fp8_t.view(torch.float8_e4m3fn)},
+                     {"so": (torch.bfloat16, [1, 16, 10240]), "pre": (torch.bfloat16, [1, 16, 2560]),
+                      "go": (torch.bfloat16, [1, 16, 4]), "scr": (torch.float32, [16, 2992])})
+    assert torch.equal(out_bf16["so"], out_fp8_16["so"]) and torch.equal(out_bf16["pre"], out_fp8_16["pre"]) and torch.equal(out_bf16["go"], out_fp8_16["go"])
 
 
 OP_TESTS = [

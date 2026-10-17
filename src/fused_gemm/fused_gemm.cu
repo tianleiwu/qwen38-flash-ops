@@ -14,6 +14,7 @@
 #endif
 #include "onnxruntime_cxx_api.h"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -173,6 +174,297 @@ skinny::Config Choose(int m, int K, int nseg, const int* n, int w_mode = 0) {
   return cfg;
 }
 
+struct DequantOutParams {
+  int num_outs;
+  bf16* out[skinny::kMaxOut];
+  int col_begin[skinny::kMaxOut];
+  int width[skinny::kMaxOut];
+};
+
+__device__ __forceinline__ uint4 DeqFp8x8ToBf16U4(uint2 raw, const float* w_scale, int col) {
+  const float4 s0 = w_scale ? __ldg(reinterpret_cast<const float4*>(w_scale + col)) : make_float4(1.f, 1.f, 1.f, 1.f);
+  const float4 s1 = w_scale ? __ldg(reinterpret_cast<const float4*>(w_scale + col + 4)) : make_float4(1.f, 1.f, 1.f, 1.f);
+  const __half2_raw hr0 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.x & 0xffffu), __NV_E4M3);
+  const __half2_raw hr1 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.x >> 16), __NV_E4M3);
+  const __half2_raw hr2 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.y & 0xffffu), __NV_E4M3);
+  const __half2_raw hr3 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.y >> 16), __NV_E4M3);
+  const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&hr0));
+  const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&hr1));
+  const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&hr2));
+  const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&hr3));
+  const __nv_bfloat162 b0 = __floats2bfloat162_rn(f0.x * s0.x, f0.y * s0.y);
+  const __nv_bfloat162 b1 = __floats2bfloat162_rn(f1.x * s0.z, f1.y * s0.w);
+  const __nv_bfloat162 b2 = __floats2bfloat162_rn(f2.x * s1.x, f2.y * s1.y);
+  const __nv_bfloat162 b3 = __floats2bfloat162_rn(f3.x * s1.z, f3.y * s1.w);
+  return make_uint4(*reinterpret_cast<const uint32_t*>(&b0), *reinterpret_cast<const uint32_t*>(&b1),
+                    *reinterpret_cast<const uint32_t*>(&b2), *reinterpret_cast<const uint32_t*>(&b3));
+}
+
+template <int WMODE, bool MULTI_OUT>
+__global__ void __launch_bounds__(256)
+    DequantWeightBf16Kernel(const uint8_t* wq, const float* w_scale, DequantOutParams op, int K, int N, int row_stride, int col_offset) {
+  const int chunks_per_row = N / 8;
+  const int64_t total_chunks = static_cast<int64_t>(K) * chunks_per_row;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total_chunks;
+       idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int r = static_cast<int>(idx / chunks_per_row);
+    const int col = static_cast<int>(idx % chunks_per_row) * 8;
+    const int src_col = col_offset + col;
+    uint4 u4;
+    if constexpr (WMODE == 0) {
+      u4 = __ldg(reinterpret_cast<const uint4*>(reinterpret_cast<const bf16*>(wq) + static_cast<size_t>(r) * row_stride + src_col));
+    } else if constexpr (WMODE == 1) {
+      const uint2 raw = __ldg(reinterpret_cast<const uint2*>(wq + static_cast<size_t>(r) * row_stride + src_col));
+      u4 = DeqFp8x8ToBf16U4(raw, w_scale, col);
+    } else {
+      const size_t fp4_row_bytes = static_cast<size_t>(row_stride) * 9 / 16;
+      const uint8_t* row_p = wq + static_cast<size_t>(r) * fp4_row_bytes;
+      const uint32_t pack8 = __ldg(reinterpret_cast<const uint32_t*>(row_p + (src_col >> 1)));
+      const uint8_t s_fp8 = row_p[(row_stride >> 1) + (src_col >> 4)];
+      const __half_raw hr = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(s_fp8), __NV_E4M3);
+      const float s_half = __half2float(*reinterpret_cast<const __half*>(&hr)) * 0.5f;
+      const float4 s0 = w_scale ? __ldg(reinterpret_cast<const float4*>(w_scale + col)) : make_float4(1.f, 1.f, 1.f, 1.f);
+      const float4 s1 = w_scale ? __ldg(reinterpret_cast<const float4*>(w_scale + col + 4)) : make_float4(1.f, 1.f, 1.f, 1.f);
+      const float sc[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+      uint32_t words_out[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float f0 = skinny::E2M1ScaledToFloat((pack8 >> (8 * i)) & 0xfu, s_half) * sc[2 * i];
+        const float f1 = skinny::E2M1ScaledToFloat((pack8 >> (8 * i + 4)) & 0xfu, s_half) * sc[2 * i + 1];
+        const __nv_bfloat162 b = __floats2bfloat162_rn(f0, f1);
+        words_out[i] = *reinterpret_cast<const uint32_t*>(&b);
+      }
+      u4 = make_uint4(words_out[0], words_out[1], words_out[2], words_out[3]);
+    }
+    if constexpr (!MULTI_OUT) {
+      *reinterpret_cast<uint4*>(op.out[0] + static_cast<size_t>(r) * N + col) = u4;
+    } else {
+      int j = 0;
+#pragma unroll
+      for (int i = 1; i < skinny::kMaxOut; ++i) {
+        if (i < op.num_outs && col >= op.col_begin[i]) j = i;
+      }
+      *reinterpret_cast<uint4*>(op.out[j] + static_cast<size_t>(r) * op.width[j] + (col - op.col_begin[j])) = u4;
+    }
+  }
+}
+
+__global__ void __launch_bounds__(256)
+    SharedExpertPrepKernel(const bf16* __restrict__ g_in, const bf16* __restrict__ u_in,
+                           const bf16* __restrict__ gx, const bf16* __restrict__ gw,
+                           bf16* __restrict__ act_out, float* __restrict__ gate_out, int K, int gk) {
+  __shared__ float s_gate[8];
+  const int m = blockIdx.x;
+  const int tid = threadIdx.x;
+  const size_t row_k = static_cast<size_t>(m) * K;
+  for (int k = tid; k < K; k += 256) {
+    act_out[row_k + k] = __float2bfloat16(skinny::SwishMulValue(g_in[row_k + k], u_in[row_k + k]));
+  }
+  float g = 0.0f;
+  const size_t row_gk = static_cast<size_t>(m) * gk;
+  for (int i = tid; i < gk; i += 256) {
+    g += __bfloat162float(gx[row_gk + i]) * __bfloat162float(gw[i]);
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) g += __shfl_xor_sync(0xffffffffu, g, off);
+  if ((tid & 31) == 0) s_gate[tid >> 5] = g;
+  __syncthreads();
+  if (tid == 0) {
+    float logit = 0.0f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) logit += s_gate[w];
+    gate_out[m] = skinny::SigmoidBf16(skinny::Round(logit));
+  }
+}
+
+__global__ void __launch_bounds__(256)
+    SharedExpertCombinePrefillKernel(const bf16* __restrict__ proj, const bf16* __restrict__ routed,
+                                     const float* __restrict__ gate, bf16* __restrict__ out, int M, int N) {
+  const int64_t total = static_cast<int64_t>(M) * N;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
+       idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int m = static_cast<int>(idx / N);
+    const float shared = skinny::Round(__bfloat162float(proj[idx]) * gate[m]);
+    out[idx] = routed ? __float2bfloat16(__bfloat162float(routed[idx]) + shared) : __float2bfloat16(shared);
+  }
+}
+
+struct PrefillGemmWorkspace {
+  std::mutex mu;
+  cublasHandle_t handle = nullptr;
+  bf16* d_w = nullptr;
+  size_t w_cap_elems = 0;
+  bf16* d_act = nullptr;
+  size_t act_cap_elems = 0;
+
+  void EnsureHandle() {
+    if (!handle) {
+      if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("fused_gemm: cublasCreate failed");
+      }
+    }
+  }
+
+  bf16* EnsureW(size_t elems) {
+    if (elems > w_cap_elems) {
+      if (d_w) cudaFree(d_w);
+      d_w = nullptr;
+      w_cap_elems = 0;
+      const size_t alloc_elems = std::max<size_t>(elems, 2560ULL * 16480ULL);
+      if (cudaMalloc(&d_w, alloc_elems * sizeof(bf16)) != cudaSuccess) {
+        throw std::runtime_error("fused_gemm: cudaMalloc(d_w) failed");
+      }
+      w_cap_elems = alloc_elems;
+    }
+    return d_w;
+  }
+
+  bf16* EnsureAct(size_t elems) {
+    if (elems > act_cap_elems) {
+      if (d_act) cudaFree(d_act);
+      d_act = nullptr;
+      act_cap_elems = 0;
+      const size_t alloc_elems = std::max<size_t>(elems, 2048ULL * 4096ULL);
+      if (cudaMalloc(&d_act, alloc_elems * sizeof(bf16)) != cudaSuccess) {
+        throw std::runtime_error("fused_gemm: cudaMalloc(d_act) failed");
+      }
+      act_cap_elems = alloc_elems;
+    }
+    return d_act;
+  }
+};
+
+PrefillGemmWorkspace& GetPrefillGemmWorkspace() {
+  static PrefillGemmWorkspace ws;
+  return ws;
+}
+
+void LaunchDequantHelper(int w_mode, bool multi_out, const uint8_t* wq_ptr, const float* w_scale,
+                         const DequantOutParams& op, int K, int N, int row_stride, int col_offset,
+                         cudaStream_t stream) {
+  const int64_t total_chunks = static_cast<int64_t>(K) * (N / 8);
+  const int threads = 256;
+  const int blocks = static_cast<int>(std::min<int64_t>(8192, (total_chunks + threads - 1) / threads));
+  if (!multi_out) {
+    if (w_mode == 0)
+      DequantWeightBf16Kernel<0, false><<<blocks, threads, 0, stream>>>(wq_ptr, w_scale, op, K, N, row_stride, col_offset);
+    else if (w_mode == 1)
+      DequantWeightBf16Kernel<1, false><<<blocks, threads, 0, stream>>>(wq_ptr, w_scale, op, K, N, row_stride, col_offset);
+    else
+      DequantWeightBf16Kernel<2, false><<<blocks, threads, 0, stream>>>(wq_ptr, w_scale, op, K, N, row_stride, col_offset);
+  } else {
+    if (w_mode == 0)
+      DequantWeightBf16Kernel<0, true><<<blocks, threads, 0, stream>>>(wq_ptr, w_scale, op, K, N, row_stride, col_offset);
+    else if (w_mode == 1)
+      DequantWeightBf16Kernel<1, true><<<blocks, threads, 0, stream>>>(wq_ptr, w_scale, op, K, N, row_stride, col_offset);
+    else
+      DequantWeightBf16Kernel<2, true><<<blocks, threads, 0, stream>>>(wq_ptr, w_scale, op, K, N, row_stride, col_offset);
+  }
+}
+
+void LaunchPrefillSkinnyGemm(int M, const skinny::Params& p, cudaStream_t stream) {
+  auto& ws = GetPrefillGemmWorkspace();
+  std::lock_guard<std::mutex> lock(ws.mu);
+  ws.EnsureHandle();
+  if (cublasSetStream(ws.handle, stream) != CUBLAS_STATUS_SUCCESS) {
+    throw std::runtime_error("SkinnyGemm(prefill): cublasSetStream failed");
+  }
+  const float alpha = 1.0f, beta = 0.0f;
+  const int K = p.K;
+  for (int s = 0; s < p.nseg; ++s) {
+    const int N = p.n[s];
+    const int out_begin = p.out_begin[s];
+    const int num_outs = p.out_begin[s + 1] - out_begin;
+    const int w_mode = p.w_mode[s];
+    const uint8_t* wq_ptr = (w_mode == 0) ? reinterpret_cast<const uint8_t*>(p.w[s]) : p.w_q[s];
+    if (w_mode == 0 && p.w_scale[s] == nullptr && num_outs == 1) {
+      if (cublasGemmEx(ws.handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, p.w[s], CUDA_R_16BF, N,
+                       p.x, CUDA_R_16BF, K, &beta, p.out[out_begin], CUDA_R_16BF, N,
+                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("SkinnyGemm(prefill): cublasGemmEx failed");
+      }
+    } else if (num_outs == 1) {
+      constexpr int kTileN = 16384;
+      bf16* w_buf = ws.EnsureW(static_cast<size_t>(K) * std::min(N, kTileN));
+      for (int col_off = 0; col_off < N; col_off += kTileN) {
+        const int cur_n = std::min(kTileN, N - col_off);
+        DequantOutParams op = {};
+        op.num_outs = 1;
+        op.out[0] = w_buf;
+        op.col_begin[0] = 0;
+        op.width[0] = cur_n;
+        LaunchDequantHelper(w_mode, false, wq_ptr, p.w_scale[s] ? (p.w_scale[s] + col_off) : nullptr,
+                            op, K, cur_n, N, col_off, stream);
+        if (cublasGemmEx(ws.handle, CUBLAS_OP_N, CUBLAS_OP_N, cur_n, M, K, &alpha, w_buf, CUDA_R_16BF, cur_n,
+                         p.x, CUDA_R_16BF, K, &beta, p.out[out_begin] + col_off, CUDA_R_16BF, N,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) {
+          throw std::runtime_error("SkinnyGemm(prefill): tiled cublasGemmEx failed");
+        }
+      }
+    } else {
+      bf16* w_buf = ws.EnsureW(static_cast<size_t>(K) * N);
+      DequantOutParams op = {};
+      op.num_outs = num_outs;
+      size_t w_off = 0;
+      for (int i = 0; i < num_outs; ++i) {
+        const int o = out_begin + i;
+        op.out[i] = w_buf + w_off;
+        op.col_begin[i] = p.col_begin[o];
+        op.width[i] = p.width[o];
+        w_off += static_cast<size_t>(K) * p.width[o];
+      }
+      LaunchDequantHelper(w_mode, true, wq_ptr, p.w_scale[s], op, K, N, N, 0, stream);
+      for (int i = 0; i < num_outs; ++i) {
+        const int o = out_begin + i;
+        const int wi = p.width[o];
+        if (cublasGemmEx(ws.handle, CUBLAS_OP_N, CUBLAS_OP_N, wi, M, K, &alpha, op.out[i], CUDA_R_16BF, wi,
+                         p.x, CUDA_R_16BF, K, &beta, p.out[o], CUDA_R_16BF, wi,
+                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) {
+          throw std::runtime_error("SkinnyGemm(prefill): multi-out cublasGemmEx failed");
+        }
+      }
+    }
+  }
+}
+
+void LaunchPrefillSharedExpertDown(int M, const skinny::Params& p, cudaStream_t stream) {
+  auto& ws = GetPrefillGemmWorkspace();
+  std::lock_guard<std::mutex> lock(ws.mu);
+  ws.EnsureHandle();
+  if (cublasSetStream(ws.handle, stream) != CUBLAS_STATUS_SUCCESS) {
+    throw std::runtime_error("SharedExpertDown(prefill): cublasSetStream failed");
+  }
+  const int K = p.K;
+  const int N = p.n[0];
+  const int gk = p.gk;
+  bf16* act_buf = ws.EnsureAct(static_cast<size_t>(M) * (K + N) + static_cast<size_t>(M) * 2 + 16);
+  bf16* d_act = act_buf;
+  bf16* d_proj = d_act + static_cast<size_t>(M) * K;
+  float* d_gate = reinterpret_cast<float*>(d_proj + static_cast<size_t>(M) * N);
+  SharedExpertPrepKernel<<<M, 256, 0, stream>>>(p.x, p.x2, p.gx, p.gw, d_act, d_gate, K, gk);
+  const bf16* w_bf16 = p.w[0];
+  if (p.w_mode[0] != 0 || p.w_scale[0] != nullptr) {
+    bf16* w_buf = ws.EnsureW(static_cast<size_t>(K) * N);
+    DequantOutParams op = {};
+    op.num_outs = 1;
+    op.out[0] = w_buf;
+    op.col_begin[0] = 0;
+    op.width[0] = N;
+    const uint8_t* wq_ptr = (p.w_mode[0] == 0) ? reinterpret_cast<const uint8_t*>(p.w[0]) : p.w_q[0];
+    LaunchDequantHelper(p.w_mode[0], false, wq_ptr, p.w_scale[0], op, K, N, N, 0, stream);
+    w_bf16 = w_buf;
+  }
+  const float alpha = 1.0f, beta = 0.0f;
+  if (cublasGemmEx(ws.handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, w_bf16, CUDA_R_16BF, N,
+                   d_act, CUDA_R_16BF, K, &beta, d_proj, CUDA_R_16BF, N,
+                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) {
+    throw std::runtime_error("SharedExpertDown(prefill): cublasGemmEx failed");
+  }
+  const int64_t total = static_cast<int64_t>(M) * N;
+  const int blocks = static_cast<int>(std::min<int64_t>(8192, (total + 255) / 256));
+  SharedExpertCombinePrefillKernel<<<blocks, 256, 0, stream>>>(d_proj, p.routed, d_gate, p.out[0], M, N);
+}
+
 struct SkinnyGemmKernelState {
   const OrtApi& api;
   std::vector<int> seg_outs;
@@ -222,7 +514,7 @@ struct SkinnyGemmKernelState {
       const int K = static_cast<int>(xshape.back());
       int64_t m64 = 1;
       for (size_t i = 0; i + 1 < xshape.size(); ++i) m64 *= xshape[i];
-      if (m64 < 1 || m64 > 32) throw std::invalid_argument("SkinnyGemm: M must be in [1, 32]");
+      if (m64 < 1) throw std::invalid_argument("SkinnyGemm: M must be >= 1");
       const int M = static_cast<int>(m64);
 
       skinny::Params p = {};
@@ -278,8 +570,19 @@ struct SkinnyGemmKernelState {
         if (K % 2 != 0) throw std::invalid_argument("SkinnyGemm: K must be even");
       }
       p.out_begin[nseg] = o;
+      cudaStream_t stream = Stream(api, raw);
+      bool all_mult8 = true;
+      for (int i = 0; i < o; ++i) {
+        if (p.width[i] % 8 != 0) all_mult8 = false;
+      }
+      if (M > 8 && all_mult8) {
+        LaunchPrefillSkinnyGemm(M, p, stream);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) throw std::runtime_error(std::string("SkinnyGemm(prefill): ") + cudaGetErrorString(err));
+        return nullptr;
+      }
       const skinny::Config cfg = Choose(M, K, nseg, p.n, p.w_mode[0]);
-      cudaError_t err = skinny::Launch(M, p, cfg, Stream(api, raw));
+      cudaError_t err = skinny::Launch(M, p, cfg, stream);
       if (err == cudaSuccess) err = cudaGetLastError();
       if (err != cudaSuccess) throw std::runtime_error(std::string("SkinnyGemm: ") + cudaGetErrorString(err));
       return nullptr;
@@ -340,10 +643,10 @@ struct SharedExpertDownKernelState {
       const int64_t count_g = Count(g), count_u = Count(c.GetInput(1)), count_gx = Count(c.GetInput(3));
       const int64_t gk = Count(c.GetInput(4));
       const int64_t M = K > 0 ? count_g / K : 0;
-      if (M < 1 || M > 4 || count_g != M * K || count_u != M * K || Count(c.GetInput(5)) != M * N ||
+      if (M < 1 || count_g != M * K || count_u != M * K || Count(c.GetInput(5)) != M * N ||
           K > skinny::kFuseMaxK || N % 8 != 0 || gk % 2 != 0 || count_gx != M * gk ||
           c.GetInput(4).GetTensorTypeAndShapeInfo().GetShape().back() != 1) {
-        throw std::invalid_argument("SharedExpertDown: shape mismatch (M must be in [1, 4])");
+        throw std::invalid_argument("SharedExpertDown: shape mismatch");
       }
       auto out = c.GetOutput(0, c.GetInput(5).GetTensorTypeAndShapeInfo().GetShape());
       skinny::Params p = {};
@@ -392,6 +695,12 @@ struct SharedExpertDownKernelState {
       }
       cfg.unroll = 8;
       cudaStream_t stream = Stream(api, raw);
+      if (M > 4) {
+        LaunchPrefillSharedExpertDown(static_cast<int>(M), p, stream);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) throw std::runtime_error(std::string("SharedExpertDown(prefill): ") + cudaGetErrorString(err));
+        return nullptr;
+      }
       auto* bridge = GetQMoESharedExpertBridge();
       if (bridge && bridge->pending && bridge->stream == stream && bridge->routed_output_ptr == p.routed &&
           bridge->launch_deferred != nullptr) {
@@ -529,81 +838,6 @@ struct SkinnyGemmOp : Ort::CustomOpBase<SkinnyGemmOp, SkinnyGemmKernelState, tru
     }
   }
 };
-
-struct DequantOutParams {
-  int num_outs;
-  bf16* out[skinny::kMaxOut];
-  int col_begin[skinny::kMaxOut];
-  int width[skinny::kMaxOut];
-};
-
-__device__ __forceinline__ uint4 DeqFp8x8ToBf16U4(uint2 raw, const float* w_scale, int col) {
-  const float4 s0 = w_scale ? __ldg(reinterpret_cast<const float4*>(w_scale + col)) : make_float4(1.f, 1.f, 1.f, 1.f);
-  const float4 s1 = w_scale ? __ldg(reinterpret_cast<const float4*>(w_scale + col + 4)) : make_float4(1.f, 1.f, 1.f, 1.f);
-  const __half2_raw hr0 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.x & 0xffffu), __NV_E4M3);
-  const __half2_raw hr1 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.x >> 16), __NV_E4M3);
-  const __half2_raw hr2 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.y & 0xffffu), __NV_E4M3);
-  const __half2_raw hr3 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.y >> 16), __NV_E4M3);
-  const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&hr0));
-  const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&hr1));
-  const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&hr2));
-  const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&hr3));
-  const __nv_bfloat162 b0 = __floats2bfloat162_rn(f0.x * s0.x, f0.y * s0.y);
-  const __nv_bfloat162 b1 = __floats2bfloat162_rn(f1.x * s0.z, f1.y * s0.w);
-  const __nv_bfloat162 b2 = __floats2bfloat162_rn(f2.x * s1.x, f2.y * s1.y);
-  const __nv_bfloat162 b3 = __floats2bfloat162_rn(f3.x * s1.z, f3.y * s1.w);
-  return make_uint4(*reinterpret_cast<const uint32_t*>(&b0), *reinterpret_cast<const uint32_t*>(&b1),
-                    *reinterpret_cast<const uint32_t*>(&b2), *reinterpret_cast<const uint32_t*>(&b3));
-}
-
-template <int WMODE, bool MULTI_OUT>
-__global__ void __launch_bounds__(256)
-    DequantWeightBf16Kernel(const uint8_t* wq, const float* w_scale, DequantOutParams op, int K, int N, int row_stride, int col_offset) {
-  const int chunks_per_row = N / 8;
-  const int64_t total_chunks = static_cast<int64_t>(K) * chunks_per_row;
-  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total_chunks;
-       idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    const int r = static_cast<int>(idx / chunks_per_row);
-    const int col = static_cast<int>(idx % chunks_per_row) * 8;
-    const int src_col = col_offset + col;
-    uint4 u4;
-    if constexpr (WMODE == 0) {
-      u4 = __ldg(reinterpret_cast<const uint4*>(reinterpret_cast<const bf16*>(wq) + static_cast<size_t>(r) * row_stride + src_col));
-    } else if constexpr (WMODE == 1) {
-      const uint2 raw = __ldg(reinterpret_cast<const uint2*>(wq + static_cast<size_t>(r) * row_stride + src_col));
-      u4 = DeqFp8x8ToBf16U4(raw, w_scale, col);
-    } else {
-      const size_t fp4_row_bytes = static_cast<size_t>(row_stride) * 9 / 16;
-      const uint8_t* row_p = wq + static_cast<size_t>(r) * fp4_row_bytes;
-      const uint32_t pack8 = __ldg(reinterpret_cast<const uint32_t*>(row_p + (src_col >> 1)));
-      const uint8_t s_fp8 = row_p[(row_stride >> 1) + (src_col >> 4)];
-      const __half_raw hr = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(s_fp8), __NV_E4M3);
-      const float s_half = __half2float(*reinterpret_cast<const __half*>(&hr)) * 0.5f;
-      const float4 s0 = w_scale ? __ldg(reinterpret_cast<const float4*>(w_scale + col)) : make_float4(1.f, 1.f, 1.f, 1.f);
-      const float4 s1 = w_scale ? __ldg(reinterpret_cast<const float4*>(w_scale + col + 4)) : make_float4(1.f, 1.f, 1.f, 1.f);
-      const float sc[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
-      uint32_t words_out[4];
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const float f0 = skinny::E2M1ScaledToFloat((pack8 >> (8 * i)) & 0xfu, s_half) * sc[2 * i];
-        const float f1 = skinny::E2M1ScaledToFloat((pack8 >> (8 * i + 4)) & 0xfu, s_half) * sc[2 * i + 1];
-        const __nv_bfloat162 b = __floats2bfloat162_rn(f0, f1);
-        words_out[i] = *reinterpret_cast<const uint32_t*>(&b);
-      }
-      u4 = make_uint4(words_out[0], words_out[1], words_out[2], words_out[3]);
-    }
-    if constexpr (!MULTI_OUT) {
-      *reinterpret_cast<uint4*>(op.out[0] + static_cast<size_t>(r) * N + col) = u4;
-    } else {
-      int j = 0;
-#pragma unroll
-      for (int i = 1; i < skinny::kMaxOut; ++i) {
-        if (i < op.num_outs && col >= op.col_begin[i]) j = i;
-      }
-      *reinterpret_cast<uint4*>(op.out[j] + static_cast<size_t>(r) * op.width[j] + (col - op.col_begin[j])) = u4;
-    }
-  }
-}
 
 struct DequantWeightBf16KernelState {
   const OrtApi& api;

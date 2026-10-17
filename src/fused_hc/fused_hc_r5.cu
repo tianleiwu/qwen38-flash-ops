@@ -560,15 +560,16 @@ __device__ __forceinline__ void DnPhase(DnSm<NR, kFp8>& sm, const bf16* __restri
   TRACE(0, 6, blk);
 }
 
-template <bool kPost, int NR, bool kTiled>
+template <bool kPost, int NR, bool kTiled, bool kFp8 = false>
 __global__ void __launch_bounds__(kThreads)
     HcDownKernel(const bf16* __restrict__ streams, const bf16* __restrict__ branch, const bf16* __restrict__ gate,
-                 const bf16* __restrict__ norm_w, const bf16* __restrict__ w_down, const bf16* __restrict__ w_inject,
-                 bf16* __restrict__ streams_out, float* __restrict__ scratch, float epsilon, float silu_alpha, int trigger_at) {
+                 const bf16* __restrict__ norm_w, const void* __restrict__ w_down, const bf16* __restrict__ w_inject,
+                 bf16* __restrict__ streams_out, float* __restrict__ scratch, float epsilon, float silu_alpha, int trigger_at,
+                 const float* __restrict__ wd_scale = nullptr) {
   extern __shared__ __align__(128) unsigned char smem_raw[];  // dynamic: DnSm<2> exceeds the 48 KB static limit
-  DnSm<NR>& sm = *reinterpret_cast<DnSm<NR>*>(smem_raw);
-  DnPhase<kPost, NR, kTiled, false, false>(sm, streams, branch, gate, norm_w, w_down, w_inject, streams_out, scratch, epsilon, silu_alpha,
-                                           trigger_at, nullptr, 0, nullptr, nullptr, nullptr);
+  DnSm<NR, kFp8>& sm = *reinterpret_cast<DnSm<NR, kFp8>*>(smem_raw);
+  DnPhase<kPost, NR, kTiled, false, kFp8>(sm, streams, branch, gate, norm_w, w_down, w_inject, streams_out, scratch, epsilon, silu_alpha,
+                                          trigger_at, nullptr, 0, nullptr, nullptr, nullptr, wd_scale);
 }
 
 // grid: (kUpBlocks, 1, rows / NR). Block hb owns h in [hb*16, hb*16+16) of every branch; NR rows share the weight stream.
@@ -825,22 +826,24 @@ __device__ __forceinline__ void UpBody(UpSm<NR, kFp8>& sm, int hb, const bf16* _
   CLK(1, 8, hb);
 }
 
-template <int NR, bool kTiled>
+template <int NR, bool kTiled, bool kFp8 = false>
 __global__ void __launch_bounds__(kThreads)
-    HcUpPreKernel(const bf16* __restrict__ streams, const bf16* __restrict__ norm_w, const bf16* __restrict__ w_up,
+    HcUpPreKernel(const bf16* __restrict__ streams, const bf16* __restrict__ norm_w, const void* __restrict__ w_up,
                   float* __restrict__ scratch, bf16* __restrict__ pre, bf16* __restrict__ gate_out,
-                  float reduction_scale, float gate_div, float gate_mul, int final_out) {
+                  float reduction_scale, float gate_div, float gate_mul, int final_out,
+                  const float* __restrict__ wu_scale = nullptr) {
   extern __shared__ __align__(128) unsigned char smem_raw[];
-  UpSm<NR>& sm = *reinterpret_cast<UpSm<NR>*>(smem_raw);
+  UpSm<NR, kFp8>& sm = *reinterpret_cast<UpSm<NR, kFp8>*>(smem_raw);
   const int hb = blockIdx.x;
   TRACE(1, 0, hb);
   CLK(1, 0, hb);
-  UpPrefetch<NR, kTiled>(sm, hb, norm_w, w_up);
+  UpPrefetch<NR, kTiled, kFp8>(sm, hb, norm_w, w_up);
   GridTrigger();
   GridWait();
   TRACE(1, 1, hb);
   CLK(1, 1, hb);
-  UpBody<NR, kTiled>(sm, hb, streams, scratch, pre, gate_out, reduction_scale, gate_div, gate_mul, final_out);
+  UpBody<NR, kTiled, false, false, kFp8>(sm, hb, streams, scratch, pre, gate_out, reduction_scale, gate_div, gate_mul, final_out,
+                                         nullptr, 0, 0.0f, nullptr, nullptr, wu_scale);
 }
 
 // ---------------------------------------------------------------- merged single-kernel block (tiled weights, one row group)
@@ -978,22 +981,41 @@ template <bool kPost, bool kInject, typename... Args>
 void LaunchDown(int64_t rows, bool tiled, cudaStream_t stream, Args... args) {
   const unsigned gx = kInject ? kDownGridX : kColSlices;  // the mixer (no inject branch) has no inject CTA column
   if (RowsPerCta(rows) == 2) {
-    if (tiled) Launch(HcDownKernel<kPost, 2, true>, dim3(gx, kSplit, static_cast<unsigned>(rows / 2)), sizeof(DnSm<2>), stream, args...);
-    else Launch(HcDownKernel<kPost, 2, false>, dim3(gx, kSplit, static_cast<unsigned>(rows / 2)), sizeof(DnSm<2>), stream, args...);
+    if (tiled) Launch(HcDownKernel<kPost, 2, true, false>, dim3(gx, kSplit, static_cast<unsigned>(rows / 2)), sizeof(DnSm<2, false>), stream, args..., static_cast<const float*>(nullptr));
+    else Launch(HcDownKernel<kPost, 2, false, false>, dim3(gx, kSplit, static_cast<unsigned>(rows / 2)), sizeof(DnSm<2, false>), stream, args..., static_cast<const float*>(nullptr));
   } else {
-    if (tiled) Launch(HcDownKernel<kPost, 1, true>, dim3(gx, kSplit, static_cast<unsigned>(rows)), sizeof(DnSm<1>), stream, args...);
-    else Launch(HcDownKernel<kPost, 1, false>, dim3(gx, kSplit, static_cast<unsigned>(rows)), sizeof(DnSm<1>), stream, args...);
+    if (tiled) Launch(HcDownKernel<kPost, 1, true, false>, dim3(gx, kSplit, static_cast<unsigned>(rows)), sizeof(DnSm<1, false>), stream, args..., static_cast<const float*>(nullptr));
+    else Launch(HcDownKernel<kPost, 1, false, false>, dim3(gx, kSplit, static_cast<unsigned>(rows)), sizeof(DnSm<1, false>), stream, args..., static_cast<const float*>(nullptr));
+  }
+}
+
+template <bool kPost, bool kInject, typename... Args>
+void LaunchDownFp8(int64_t rows, cudaStream_t stream, Args... args) {
+  const unsigned gx = kInject ? kDownGridX : kColSlices;
+  if (RowsPerCta(rows) == 2) {
+    Launch(HcDownKernel<kPost, 2, true, true>, dim3(gx, kSplit, static_cast<unsigned>(rows / 2)), sizeof(DnSm<2, true>), stream, args...);
+  } else {
+    Launch(HcDownKernel<kPost, 1, true, true>, dim3(gx, kSplit, static_cast<unsigned>(rows)), sizeof(DnSm<1, true>), stream, args...);
   }
 }
 
 template <typename... Args>
 void LaunchUp(int64_t rows, bool tiled, cudaStream_t stream, Args... args) {
   if (RowsPerCta(rows) == 2) {
-    if (tiled) Launch(HcUpPreKernel<2, true>, dim3(kUpBlocks, 1, static_cast<unsigned>(rows / 2)), sizeof(UpSm<2>), stream, args...);
-    else Launch(HcUpPreKernel<2, false>, dim3(kUpBlocks, 1, static_cast<unsigned>(rows / 2)), sizeof(UpSm<2>), stream, args...);
+    if (tiled) Launch(HcUpPreKernel<2, true, false>, dim3(kUpBlocks, 1, static_cast<unsigned>(rows / 2)), sizeof(UpSm<2, false>), stream, args..., static_cast<const float*>(nullptr));
+    else Launch(HcUpPreKernel<2, false, false>, dim3(kUpBlocks, 1, static_cast<unsigned>(rows / 2)), sizeof(UpSm<2, false>), stream, args..., static_cast<const float*>(nullptr));
   } else {
-    if (tiled) Launch(HcUpPreKernel<1, true>, dim3(kUpBlocks, 1, static_cast<unsigned>(rows)), sizeof(UpSm<1>), stream, args...);
-    else Launch(HcUpPreKernel<1, false>, dim3(kUpBlocks, 1, static_cast<unsigned>(rows)), sizeof(UpSm<1>), stream, args...);
+    if (tiled) Launch(HcUpPreKernel<1, true, false>, dim3(kUpBlocks, 1, static_cast<unsigned>(rows)), sizeof(UpSm<1, false>), stream, args..., static_cast<const float*>(nullptr));
+    else Launch(HcUpPreKernel<1, false, false>, dim3(kUpBlocks, 1, static_cast<unsigned>(rows)), sizeof(UpSm<1, false>), stream, args..., static_cast<const float*>(nullptr));
+  }
+}
+
+template <typename... Args>
+void LaunchUpFp8(int64_t rows, cudaStream_t stream, Args... args) {
+  if (RowsPerCta(rows) == 2) {
+    Launch(HcUpPreKernel<2, true, true>, dim3(kUpBlocks, 1, static_cast<unsigned>(rows / 2)), sizeof(UpSm<2, true>), stream, args...);
+  } else {
+    Launch(HcUpPreKernel<1, true, true>, dim3(kUpBlocks, 1, static_cast<unsigned>(rows)), sizeof(UpSm<1, true>), stream, args...);
   }
 }
 
@@ -1307,11 +1329,18 @@ struct HcBlockState {
           }
         }
       } else {
-        if (fp8) throw std::invalid_argument("HcBlock: FP8 weights require tiled merged execution (rows in 1..4)");
-        LaunchDown<kPost, true>(rows, tiled_d, stream, In(c, 0), br, gt, In(c, o), In(c, o + 1), In(c, o + 2), streams_out,
-                                scratch_ptr, epsilon, silu_alpha, 1);
-        LaunchUp(rows, tiled_u, stream, kPost ? streams_out : In(c, 0), In(c, o), In(c, o + 3), scratch_ptr, Out(pre), Out(gate),
-                 reduction_scale, gate_div, gate_mul, FinalOut());
+        if (fp8) {
+          if (!tiled_d || !tiled_u) throw std::invalid_argument("HcBlock: FP8 weights must be tiled");
+          LaunchDownFp8<kPost, true>(rows, stream, In(c, 0), br, gt, In(c, o), wd_ptr, In(c, o + 2), streams_out,
+                                     scratch_ptr, epsilon, silu_alpha, 1, d_wd_scale);
+          LaunchUpFp8(rows, stream, kPost ? streams_out : In(c, 0), In(c, o), wu_ptr, scratch_ptr, Out(pre), Out(gate),
+                      reduction_scale, gate_div, gate_mul, FinalOut(), d_wu_scale);
+        } else {
+          LaunchDown<kPost, true>(rows, tiled_d, stream, In(c, 0), br, gt, In(c, o), wd_ptr, In(c, o + 2), streams_out,
+                                  scratch_ptr, epsilon, silu_alpha, 1);
+          LaunchUp(rows, tiled_u, stream, kPost ? streams_out : In(c, 0), In(c, o), wu_ptr, scratch_ptr, Out(pre), Out(gate),
+                   reduction_scale, gate_div, gate_mul, FinalOut());
+        }
       }
       CheckLaunch();
       return nullptr;

@@ -42,6 +42,48 @@ __global__ void CheckCursorKernel(const int32_t* lengths, const int32_t* committ
   composite[0] = status;
 }
 
+struct SharedDsaPrefillWorkspace {
+  std::mutex mu;
+  __nv_bfloat16* prepared = nullptr;
+  size_t prepared_elems = 0;
+  uint32_t* bitmap = nullptr;
+  size_t bitmap_elems = 0;
+  float* workspace = nullptr;
+  size_t workspace_elems = 0;
+
+  void Ensure(size_t prep_n, size_t bit_n, size_t ws_n, __nv_bfloat16** out_prep, uint32_t** out_bit, float** out_ws) {
+    if (prep_n > prepared_elems) {
+      if (prepared) cudaFree(prepared);
+      prepared = nullptr;
+      prepared_elems = 0;
+      CheckCuda(cudaMalloc(&prepared, prep_n * sizeof(__nv_bfloat16)));
+      prepared_elems = prep_n;
+    }
+    if (bit_n > bitmap_elems) {
+      if (bitmap) cudaFree(bitmap);
+      bitmap = nullptr;
+      bitmap_elems = 0;
+      CheckCuda(cudaMalloc(&bitmap, bit_n * sizeof(uint32_t)));
+      bitmap_elems = bit_n;
+    }
+    if (ws_n > workspace_elems) {
+      if (workspace) cudaFree(workspace);
+      workspace = nullptr;
+      workspace_elems = 0;
+      CheckCuda(cudaMalloc(&workspace, ws_n * sizeof(float)));
+      workspace_elems = ws_n;
+    }
+    *out_prep = prepared;
+    *out_bit = bitmap;
+    *out_ws = workspace;
+  }
+};
+
+SharedDsaPrefillWorkspace& GetSharedDsaPrefillWorkspace() {
+  static SharedDsaPrefillWorkspace ws;
+  return ws;
+}
+
 struct GuardedKernel {
   const OrtApi& api;
   onnxruntime::contrib::DynamicSparseAttentionParameters parameters;
@@ -142,7 +184,7 @@ struct GuardedKernel {
     try {
       Ort::KernelContext context(raw_context);
       const auto shape = context.GetInput(0).GetTensorTypeAndShapeInfo().GetShape();
-      if (shape.size() != 3 || shape[0] != 1 || shape[1] < 1 || shape[1] > 128 ||
+      if (shape.size() != 3 || shape[0] != 1 || shape[1] < 1 || shape[1] > 4096 ||
           shape[2] != parameters.query_hidden_size) throw std::invalid_argument("GuardedDSA: query shape");
       auto params = parameters;
       params.sequence_length = static_cast<int>(shape[1]);
@@ -210,9 +252,22 @@ struct GuardedKernel {
       data.selected_indices = context.GetInput(5).GetTensorData<int32_t>();
       data.selected_counts = context.GetInput(6).GetTensorData<int32_t>();
       data.seqlens_k = context.GetInput(7).GetTensorData<int32_t>();
-      data.prepared_query = prepared;
+      __nv_bfloat16* active_prep = prepared;
+      uint32_t* active_bitmap = bitmap;
+      float* active_ws = workspace;
+      if (params.sequence_length > 128) {
+        auto& sws = GetSharedDsaPrefillWorkspace();
+        std::lock_guard<std::mutex> lock(sws.mu);
+        const size_t prep_n = static_cast<size_t>(params.sequence_length) * params.query_hidden_size;
+        const size_t bit_n = native::GetDynamicSparseAttentionValidationWorkspaceSize(
+            params, properties.sharedMemPerBlock);
+        const size_t ws_n = native::GetDynamicSparseAttentionWorkspaceSize(
+            params, sizeof(__nv_bfloat16), properties.sharedMemPerBlock);
+        sws.Ensure(prep_n, bit_n, ws_n, &active_prep, &active_bitmap, &active_ws);
+      }
+      data.prepared_query = active_prep;
       data.output = reinterpret_cast<__nv_bfloat16*>(output.GetTensorMutableData<Ort::BFloat16_t>());
-      data.attention_workspace = workspace;
+      data.attention_workspace = active_ws;
       auto error = error_output.GetTensorMutableData<int32_t>();
       // 2 rows: chained through the S=1 decode path with per-row flags (scratch) and a composite status output
       const bool row_chain = params.sequence_length > 1 && static_cast<size_t>(params.sequence_length) <= kMaxRows;
@@ -225,7 +280,7 @@ struct GuardedKernel {
       Ort::ThrowOnError(api.KernelContext_GetGPUComputeStream(raw_context, &raw_stream));
       auto stream = static_cast<cudaStream_t>(raw_stream);
       auto status = native::ValidateDynamicSparseAttentionOnDevice(stream, data.selected_indices,
-          data.selected_counts, data.seqlens_k, nullptr, params, flags, bitmap,
+          data.selected_counts, data.seqlens_k, nullptr, params, flags, active_bitmap,
           properties.sharedMemPerBlock, false, row_chain, committed_ptr);
       if (!status.IsOK()) return api.CreateStatus(ORT_FAIL, status.ErrorMessage().c_str());
       status = native::LaunchDynamicSparseAttention<__nv_bfloat16>(stream, params, data, false, false,
