@@ -129,21 +129,68 @@ __device__ __forceinline__ uint4 LoadWeightsFp8AsBf16(const uint8_t* p) {
   return UnpackFp8U2ToBf16U4(LoadWeights4(p));
 }
 
+template <int M>
+__device__ __forceinline__ void FmaFp8U2(float (&acc)[M][8], const uint2& raw, const float (&xv)[M]) {
+  const __half2_raw hr0 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.x & 0xffffu), __NV_E4M3);
+  const __half2_raw hr1 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.x >> 16), __NV_E4M3);
+  const __half2_raw hr2 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.y & 0xffffu), __NV_E4M3);
+  const __half2_raw hr3 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.y >> 16), __NV_E4M3);
+  const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&hr0));
+  const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&hr1));
+  const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&hr2));
+  const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&hr3));
+#pragma unroll
+  for (int m = 0; m < M; ++m) {
+    acc[m][0] = fmaf(f0.x, xv[m], acc[m][0]);
+    acc[m][1] = fmaf(f0.y, xv[m], acc[m][1]);
+    acc[m][2] = fmaf(f1.x, xv[m], acc[m][2]);
+    acc[m][3] = fmaf(f1.y, xv[m], acc[m][3]);
+    acc[m][4] = fmaf(f2.x, xv[m], acc[m][4]);
+    acc[m][5] = fmaf(f2.y, xv[m], acc[m][5]);
+    acc[m][6] = fmaf(f3.x, xv[m], acc[m][6]);
+    acc[m][7] = fmaf(f3.y, xv[m], acc[m][7]);
+  }
+}
+
 __device__ __forceinline__ float E2M1ToFloat(uint32_t nib) {
   const uint32_t m = nib & 7u;
   const uint32_t exp_mant = (m == 0u) ? 0u : ((m == 1u ? 252u : (m + 252u)) << 22);
   return __uint_as_float(((nib & 8u) << 28) | exp_mant);
 }
 
+__device__ __forceinline__ float E2M1ScaledToFloat(uint32_t nib, float s_half) {
+  const uint32_t mag2 = (0xC8643210u >> ((nib & 7u) * 4u)) & 0xfu;
+  const float f = static_cast<float>(mag2) * s_half;
+  return __uint_as_float(__float_as_uint(f) ^ ((nib & 8u) << 28));
+}
+
+template <int M>
+__device__ __forceinline__ void FmaFp4U1(float (&acc)[M][8], uint32_t pack8, uint8_t s_fp8, const float (&xv)[M]) {
+  const __half_raw hr = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(s_fp8), __NV_E4M3);
+  const float s_half = __half2float(*reinterpret_cast<const __half*>(&hr)) * 0.5f;
+  float f[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    f[i] = E2M1ScaledToFloat((pack8 >> (4 * i)) & 0xfu, s_half);
+  }
+#pragma unroll
+  for (int m = 0; m < M; ++m) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      acc[m][i] = fmaf(f[i], xv[m], acc[m][i]);
+    }
+  }
+}
+
 // Every product of E2M1 and E4M3FN has <= 6 significand bits and exponent in [-10, 10], so it is 100% bit-exact in BFloat16.
 __device__ __forceinline__ uint4 UnpackFp4ToBf16U4(uint32_t pack8, uint8_t s_fp8) {
   const __half_raw hr = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(s_fp8), __NV_E4M3);
-  const float s = __half2float(*reinterpret_cast<const __half*>(&hr));
+  const float s_half = __half2float(*reinterpret_cast<const __half*>(&hr)) * 0.5f;
   uint32_t words[4];
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    const float f0 = E2M1ToFloat((pack8 >> (8 * i)) & 0xfu) * s;
-    const float f1 = E2M1ToFloat((pack8 >> (8 * i + 4)) & 0xfu) * s;
+    const float f0 = E2M1ScaledToFloat((pack8 >> (8 * i)) & 0xfu, s_half);
+    const float f1 = E2M1ScaledToFloat((pack8 >> (8 * i + 4)) & 0xfu, s_half);
     const __nv_bfloat162 b = __floats2bfloat162_rn(f0, f1);
     words[i] = *reinterpret_cast<const uint32_t*>(&b);
   }
@@ -188,7 +235,7 @@ __device__ __forceinline__ void StoreOut(const Params& p, int seg, int m, int n,
   }
 }
 
-template <int M, int TX, int THREADS, int C, int U, bool NARROW, bool FUSE>
+template <int M, int TX, int THREADS, int C, int U, bool NARROW, bool FUSE, int WMODE>
 __device__ __forceinline__ void GemvBody(const Params& p, int seg, int tile) {
   constexpr int TXE = NARROW ? 1 : TX;
   constexpr int NCOL = NARROW ? 4 : TX * 8;
@@ -219,23 +266,22 @@ __device__ __forceinline__ void GemvBody(const Params& p, int seg, int tile) {
     for (int i = 0; i < 8; ++i) acc[m][i] = 0.f;
 
   const bf16* wp0 = w + col;
-  const int w_mode = p.w_mode[seg];
   const uint8_t* wq = p.w_q[seg];
   const size_t fp4_row_bytes = static_cast<size_t>(N) * 9 / 16;
-  uint4 vpre[FUSE ? U : 1];
-  uint2 vpre_fp8[FUSE ? U : 1];
-  uint32_t vpre_fp4[FUSE ? U : 1];
-  uint8_t vpre_fp4_s[FUSE ? U : 1];
+  uint4 vpre[(FUSE && WMODE == 0) ? U : 1];
+  uint2 vpre_fp8[(FUSE && WMODE == 1) ? U : 1];
+  uint32_t vpre_fp4[(FUSE && WMODE == 2) ? U : 1];
+  uint8_t vpre_fp4_s[(FUSE && WMODE == 2) ? U : 1];
   static_assert(!FUSE || M * kFuseMaxK * 4 <= 16 * 1024, "fused xs buffer");
   if constexpr (FUSE) {
     // First weight loads go out before the prologue below so their latency overlaps it.
-    if (w_mode == 0) {
+    if constexpr (WMODE == 0) {
 #pragma unroll
       for (int u = 0; u < U; ++u) {
         const int kk = kbeg + lane_k + u * LANES;
         vpre[u] = (valid && kk < kend) ? LoadWeights(wp0 + static_cast<size_t>(kk) * N) : make_uint4(0, 0, 0, 0);
       }
-    } else if (w_mode == 1) {
+    } else if constexpr (WMODE == 1) {
 #pragma unroll
       for (int u = 0; u < U; ++u) {
         const int kk = kbeg + lane_k + u * LANES;
@@ -282,7 +328,7 @@ __device__ __forceinline__ void GemvBody(const Params& p, int seg, int tile) {
   if (valid) {
     const bf16* wp = w + col;
     const size_t row_stride = N;
-    if (NARROW || w_mode == 0) {
+    if constexpr (NARROW || WMODE == 0) {
       for (int k = kbeg + lane_k; k < kend; k += LANES * U) {
         uint4 v[U];
         float xv[U][M];
@@ -292,13 +338,17 @@ __device__ __forceinline__ void GemvBody(const Params& p, int seg, int tile) {
           v[u] = make_uint4(0, 0, 0, 0);
 #pragma unroll
           for (int m = 0; m < M; ++m) xv[u][m] = 0.f;
-          if (FUSE && k == kbeg + lane_k) {
-            v[u] = vpre[FUSE ? u : 0];
-            if (kk < kend) {
+          if constexpr (FUSE) {
+            if (k == kbeg + lane_k) {
+              v[u] = vpre[u];
+              if (kk < kend) {
 #pragma unroll
-              for (int m = 0; m < M; ++m) xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+                for (int m = 0; m < M; ++m) xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+              }
+              continue;
             }
-          } else if (kk < kend) {
+          }
+          if (kk < kend) {
             if constexpr (NARROW) {
               const uint2 h = LoadWeights4(wp + static_cast<size_t>(kk) * row_stride);
               v[u].x = h.x;
@@ -329,7 +379,7 @@ __device__ __forceinline__ void GemvBody(const Params& p, int seg, int tile) {
           }
         }
       }
-    } else if (w_mode == 1) {
+    } else if constexpr (WMODE == 1) {
       const uint8_t* wp_fp8 = wq + col;
       for (int k = kbeg + lane_k; k < kend; k += LANES * U) {
         uint2 raw[U];
@@ -340,13 +390,17 @@ __device__ __forceinline__ void GemvBody(const Params& p, int seg, int tile) {
           raw[u] = make_uint2(0, 0);
 #pragma unroll
           for (int m = 0; m < M; ++m) xv[u][m] = 0.f;
-          if (FUSE && k == kbeg + lane_k) {
-            raw[u] = vpre_fp8[FUSE ? u : 0];
-            if (kk < kend) {
+          if constexpr (FUSE) {
+            if (k == kbeg + lane_k) {
+              raw[u] = vpre_fp8[u];
+              if (kk < kend) {
 #pragma unroll
-              for (int m = 0; m < M; ++m) xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+                for (int m = 0; m < M; ++m) xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+              }
+              continue;
             }
-          } else if (kk < kend) {
+          }
+          if (kk < kend) {
             raw[u] = LoadWeights4(wp_fp8 + static_cast<size_t>(kk) * row_stride);
 #pragma unroll
             for (int m = 0; m < M; ++m) {
@@ -360,14 +414,7 @@ __device__ __forceinline__ void GemvBody(const Params& p, int seg, int tile) {
         }
 #pragma unroll
         for (int u = 0; u < U; ++u) {
-          const uint4 v = UnpackFp8U2ToBf16U4(raw[u]);
-#pragma unroll
-          for (int m = 0; m < M; ++m) {
-            FmaWord(acc[m], 0, v.x, xv[u][m]);
-            FmaWord(acc[m], 2, v.y, xv[u][m]);
-            FmaWord(acc[m], 4, v.z, xv[u][m]);
-            FmaWord(acc[m], 6, v.w, xv[u][m]);
-          }
+          FmaFp8U2<M>(acc, raw[u], xv[u]);
         }
       }
     } else {
@@ -382,14 +429,18 @@ __device__ __forceinline__ void GemvBody(const Params& p, int seg, int tile) {
           raw_s[u] = 0u;
 #pragma unroll
           for (int m = 0; m < M; ++m) xv[u][m] = 0.f;
-          if (FUSE && k == kbeg + lane_k) {
-            raw_p[u] = vpre_fp4[FUSE ? u : 0];
-            raw_s[u] = vpre_fp4_s[FUSE ? u : 0];
-            if (kk < kend) {
+          if constexpr (FUSE) {
+            if (k == kbeg + lane_k) {
+              raw_p[u] = vpre_fp4[u];
+              raw_s[u] = vpre_fp4_s[u];
+              if (kk < kend) {
 #pragma unroll
-              for (int m = 0; m < M; ++m) xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+                for (int m = 0; m < M; ++m) xv[u][m] = xs[m * kFuseMaxK + kk - kbeg];
+              }
+              continue;
             }
-          } else if (kk < kend) {
+          }
+          if (kk < kend) {
             const uint8_t* row_p = wq + static_cast<size_t>(kk) * fp4_row_bytes;
             raw_p[u] = LoadWeightsU32(row_p + (col >> 1));
             raw_s[u] = row_p[(N >> 1) + (col >> 4)];
@@ -405,14 +456,7 @@ __device__ __forceinline__ void GemvBody(const Params& p, int seg, int tile) {
         }
 #pragma unroll
         for (int u = 0; u < U; ++u) {
-          const uint4 v = UnpackFp4ToBf16U4(raw_p[u], raw_s[u]);
-#pragma unroll
-          for (int m = 0; m < M; ++m) {
-            FmaWord(acc[m], 0, v.x, xv[u][m]);
-            FmaWord(acc[m], 2, v.y, xv[u][m]);
-            FmaWord(acc[m], 4, v.z, xv[u][m]);
-            FmaWord(acc[m], 6, v.w, xv[u][m]);
-          }
+          FmaFp4U1<M>(acc, raw_p[u], raw_s[u], xv[u]);
         }
       }
     }
@@ -487,20 +531,32 @@ __device__ __forceinline__ void GemvBody(const Params& p, int seg, int tile) {
   }
 }
 
-template <int M, int TX, int THREADS, int C, int U, bool FUSE = false>
-__global__ void __launch_bounds__(THREADS) GemvKernel(Params p) {
+template <int M, int TX, int THREADS, int C, int U, bool FUSE = false, int WMODE = 0>
+__global__ void __launch_bounds__(
+    THREADS, (M <= 2 && !FUSE && THREADS == 256) ? 4 : (M <= 2 && (!FUSE ? THREADS <= 512 : THREADS == 256) ? 2 : 1))
+    GemvKernel(Params p) {
   if (p.trigger == 1) GridTrigger();
   const int bx = blockIdx.x;
   int seg = 0;
 #pragma unroll
   for (int i = 1; i < kMaxSeg; ++i) seg += (i < p.nseg && bx >= p.tile_begin[i]) ? 1 : 0;
   if constexpr (FUSE) {
-    GemvBody<M, TX, THREADS, C, U, false, FUSE>(p, seg, bx - p.tile_begin[seg]);  // single segment, N % 8 == 0
+    GemvBody<M, TX, THREADS, C, U, false, FUSE, WMODE>(p, seg, bx - p.tile_begin[seg]);  // single segment, N % 8 == 0
   } else if ((p.n[seg] & 7) != 0) {
-    GemvBody<M, TX, THREADS, C, U, true, FUSE>(p, seg, bx - p.tile_begin[seg]);
+    GemvBody<M, TX, THREADS, C, U, true, FUSE, 0>(p, seg, bx - p.tile_begin[seg]);
   } else {
-    GemvBody<M, TX, THREADS, C, U, false, FUSE>(p, seg, bx - p.tile_begin[seg]);
+    GemvBody<M, TX, THREADS, C, U, false, FUSE, WMODE>(p, seg, bx - p.tile_begin[seg]);
   }
+}
+
+template <int M, int TX, int THREADS, int C, int U, bool FUSE = false, int WMODE = 0>
+cudaError_t LaunchKernelW(const cudaLaunchConfig_t& cfg, const Params& p) {
+  if constexpr (C > 8) {
+    static const cudaError_t attr_status = cudaFuncSetAttribute(
+        GemvKernel<M, TX, THREADS, C, U, FUSE, WMODE>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    if (attr_status != cudaSuccess) return attr_status;
+  }
+  return cudaLaunchKernelEx(&cfg, GemvKernel<M, TX, THREADS, C, U, FUSE, WMODE>, p);
 }
 
 template <int M, int TX, int THREADS, int C, int U, bool FUSE = false>
@@ -531,12 +587,13 @@ cudaError_t LaunchT(Params p, cudaStream_t stream) {
   }
   cfg.attrs = attr;
   cfg.numAttrs = n_attr;
-  if constexpr (C > 8) {
-    static const cudaError_t attr_status = cudaFuncSetAttribute(
-        GemvKernel<M, TX, THREADS, C, U, FUSE>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-    if (attr_status != cudaSuccess) return attr_status;
+  if constexpr (TX >= 4 && C <= 8 && (M <= 2 || (M == 4 && TX == 8 && THREADS <= 512 && C == 8 && U == 4 && !FUSE))) {
+    if (p.w_mode[0] == 1) return LaunchKernelW<M, TX, THREADS, C, U, FUSE, 1>(cfg, p);
+    if constexpr (M <= 2) {
+      if (p.w_mode[0] == 2) return LaunchKernelW<M, TX, THREADS, C, U, FUSE, 2>(cfg, p);
+    }
   }
-  return cudaLaunchKernelEx(&cfg, GemvKernel<M, TX, THREADS, C, U, FUSE>, p);
+  return LaunchKernelW<M, TX, THREADS, C, U, FUSE, 0>(cfg, p);
   }
 }
 
@@ -554,7 +611,6 @@ cudaError_t DispatchC(const Params& p, int c, cudaStream_t s) {
     case 2: return LaunchT<M, TX, THREADS, 2, U>(p, s);
     case 4: return LaunchT<M, TX, THREADS, 4, U>(p, s);
     case 8: return LaunchT<M, TX, THREADS, 8, U>(p, s);
-    case 16: return LaunchT<M, TX, THREADS, 16, U>(p, s);
     default: return cudaErrorInvalidValue;
   }
 }
@@ -562,8 +618,6 @@ cudaError_t DispatchC(const Params& p, int c, cudaStream_t s) {
 template <int M, int THREADS, int U>
 cudaError_t DispatchTX(const Params& p, const Config& cfg, cudaStream_t s) {
   switch (cfg.tx) {
-    case 1: return DispatchC<M, 1, THREADS, U>(p, cfg.cluster, s);
-    case 2: return DispatchC<M, 2, THREADS, U>(p, cfg.cluster, s);
     case 4: return DispatchC<M, 4, THREADS, U>(p, cfg.cluster, s);
     case 8: return DispatchC<M, 8, THREADS, U>(p, cfg.cluster, s);
     case 16: return DispatchC<M, 16, THREADS, U>(p, cfg.cluster, s);
@@ -576,10 +630,8 @@ template <int M>
 cudaError_t DispatchThreads(const Params& p, const Config& cfg, cudaStream_t s) {
   if (cfg.threads == 256 && cfg.unroll == 8) return DispatchTX<M, 256, 8>(p, cfg, s);
   if (cfg.threads == 256 && cfg.unroll == 4) return DispatchTX<M, 256, 4>(p, cfg, s);
-  if (cfg.threads == 128 && cfg.unroll == 8) return DispatchTX<M, 128, 8>(p, cfg, s);
   if (cfg.threads == 512 && cfg.unroll == 4) return DispatchTX<M, 512, 4>(p, cfg, s);
   if (cfg.threads == 512 && cfg.unroll == 8) return DispatchTX<M, 512, 8>(p, cfg, s);
-  if (cfg.threads == 1024 && cfg.unroll == 4) return DispatchTX<M, 1024, 4>(p, cfg, s);
   if (cfg.threads == 1024 && cfg.unroll == 8) return DispatchTX<M, 1024, 8>(p, cfg, s);
   return cudaErrorInvalidValue;
 }
@@ -589,6 +641,14 @@ inline cudaError_t LaunchRows(int m, const Params& p, const Config& cfg, cudaStr
     case 1: return DispatchThreads<1>(p, cfg, s);
 #ifndef SKINNY_M1_ONLY
     case 2: return DispatchThreads<2>(p, cfg, s);
+    case 4:
+      if (cfg.tx == 8 && cfg.threads == 256 && cfg.cluster == 8 && cfg.unroll == 4)
+        return LaunchT<4, 8, 256, 8, 4>(p, s);
+      if (cfg.tx == 8 && cfg.threads == 256 && cfg.cluster == 4 && cfg.unroll == 4)
+        return LaunchT<4, 8, 256, 4, 4>(p, s);
+      if (cfg.tx == 8 && cfg.threads == 256 && cfg.cluster == 2 && cfg.unroll == 4)
+        return LaunchT<4, 8, 256, 2, 4>(p, s);
+      return cudaErrorInvalidValue;
 #endif
     default: return cudaErrorInvalidValue;
   }
@@ -603,8 +663,8 @@ inline cudaError_t Launch(int m, const Params& p, const Config& cfg, cudaStream_
   if (m < 1) return cudaErrorInvalidValue;
   int done = 0;
   while (done < m) {
-    int chunk = std::min(m - done, 2);
-    while (chunk > 1 && !RowsFit(chunk, cfg)) --chunk;
+    int chunk = std::min(m - done, 4);
+    while (chunk > 1 && (chunk == 3 || !RowsFit(chunk, cfg))) --chunk;
     Params q = p;
     q.x = p.x + static_cast<size_t>(done) * p.K;
     if (done + chunk < m) q.trigger = 0;  // only the last row block may release PDL dependents
@@ -634,6 +694,8 @@ cudaError_t FusedRows(const Params& p, const Config& cfg, cudaStream_t s) {
   if (cfg.threads == 512 && cfg.cluster == 1) return FusedTX<M, 512, 1>(p, cfg.tx, s);
   if (cfg.threads == 256 && cfg.cluster == 2) return FusedTX<M, 256, 2>(p, cfg.tx, s);
   if (cfg.threads == 512 && cfg.cluster == 2) return FusedTX<M, 512, 2>(p, cfg.tx, s);
+  if (cfg.threads == 256 && cfg.cluster == 4) return FusedTX<M, 256, 4>(p, cfg.tx, s);
+  if (cfg.threads == 512 && cfg.cluster == 4) return FusedTX<M, 512, 4>(p, cfg.tx, s);
   return cudaErrorInvalidValue;
 }
 

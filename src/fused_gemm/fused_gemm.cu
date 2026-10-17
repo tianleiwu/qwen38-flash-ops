@@ -58,14 +58,14 @@ int64_t Count(const Ort::ConstValue& v) {
   return n;
 }
 
-skinny::Config Choose(int m, int K, int nseg, const int* n) {
+skinny::Config Choose(int m, int K, int nseg, const int* n, int w_mode = 0) {
   int total = 0;
   for (int s = 0; s < nseg; ++s) total += n[s];
   struct Entry {
     int K, total, nseg;
     skinny::Config cfg;
   };
-  static const Entry table[] = {
+  static const Entry table_bf16[] = {
       {2560, 16480, 1, {16, 1, 1024, 8}},
       {2560, 13952, 1, {8, 1, 512, 8}},
       {2560, 12800, 1, {8, 1, 512, 8}},
@@ -77,9 +77,27 @@ skinny::Config Choose(int m, int K, int nseg, const int* n) {
       {10240, 324, 2, {4, 8, 1024, 8}},
       {2560, 248320, 1, {16, 1, 256, 8}},
   };
+  static const Entry table_fp8[] = {
+      {2560, 16480, 1, {16, 1, 1024, 8}},
+      {2560, 13952, 1, {16, 1, 1024, 8}},
+      {2560, 12800, 1, {16, 1, 1024, 8}},
+      {2560, 1792, 1, {8, 8, 512, 8}},
+      {6144, 2560, 1, {8, 8, 256, 8}},
+      {2560, 2560, 1, {8, 8, 256, 4}},
+      {640, 2560, 1, {4, 1, 512, 8}},
+      {10240, 320, 1, {4, 8, 512, 4}},
+      {320, 10240, 1, {16, 1, 1024, 8}},
+      {10240, 324, 2, {4, 8, 1024, 8}},
+      {2560, 248320, 1, {32, 2, 256, 8}},
+  };
   // The config (hence the reduction order) is deliberately independent of the number of rows.
   (void)m;
-  for (const auto& e : table) {
+  if (w_mode == 1) {
+    for (const auto& e : table_fp8) {
+      if (e.K == K && e.total == total && e.nseg == nseg) return e.cfg;
+    }
+  }
+  for (const auto& e : table_bf16) {
     if (e.K == K && e.total == total && e.nseg == nseg) return e.cfg;
   }
   // Generic fallback: ~256 columns per CTA, K split over a cluster so that >= ~256 CTAs run.
@@ -197,7 +215,7 @@ struct SkinnyGemmKernelState {
         if (K % 2 != 0) throw std::invalid_argument("SkinnyGemm: K must be even");
       }
       p.out_begin[nseg] = o;
-      const skinny::Config cfg = Choose(M, K, nseg, p.n);
+      const skinny::Config cfg = Choose(M, K, nseg, p.n, p.w_mode[0]);
       cudaError_t err = skinny::Launch(M, p, cfg, Stream(api, raw));
       if (err == cudaSuccess) err = cudaGetLastError();
       if (err != cudaSuccess) throw std::runtime_error(std::string("SkinnyGemm: ") + cudaGetErrorString(err));
@@ -293,9 +311,15 @@ struct SharedExpertDownKernelState {
       p.routed = In(c, 5);
       p.gk = static_cast<int>(gk);
       skinny::Config cfg;
-      cfg.tx = 4;
-      cfg.cluster = 1;
-      cfg.threads = 512;
+      if (p.w_mode[0] == 1) {
+        cfg.tx = 16;
+        cfg.cluster = 4;
+        cfg.threads = 512;
+      } else {
+        cfg.tx = 4;
+        cfg.cluster = 1;
+        cfg.threads = 512;
+      }
       cfg.unroll = 8;
       cudaError_t err = skinny::LaunchFused(static_cast<int>(M), p, cfg, Stream(api, raw));
       if (err == cudaSuccess) err = cudaGetLastError();
@@ -420,44 +444,109 @@ struct SkinnyGemmOp : Ort::CustomOpBase<SkinnyGemmOp, SkinnyGemmKernelState, tru
   }
 };
 
-__global__ void DequantWeightBf16Kernel(const uint8_t* wq, const float* w_scale, bf16* out, int K, int N, int w_mode) {
-  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+struct DequantOutParams {
+  int num_outs;
+  bf16* out[skinny::kMaxOut];
+  int col_begin[skinny::kMaxOut];
+  int width[skinny::kMaxOut];
+};
+
+__device__ __forceinline__ uint4 DeqFp8x8ToBf16U4(uint2 raw, const float* w_scale, int col) {
+  const float4 s0 = w_scale ? __ldg(reinterpret_cast<const float4*>(w_scale + col)) : make_float4(1.f, 1.f, 1.f, 1.f);
+  const float4 s1 = w_scale ? __ldg(reinterpret_cast<const float4*>(w_scale + col + 4)) : make_float4(1.f, 1.f, 1.f, 1.f);
+  const __half2_raw hr0 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.x & 0xffffu), __NV_E4M3);
+  const __half2_raw hr1 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.x >> 16), __NV_E4M3);
+  const __half2_raw hr2 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.y & 0xffffu), __NV_E4M3);
+  const __half2_raw hr3 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(raw.y >> 16), __NV_E4M3);
+  const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&hr0));
+  const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&hr1));
+  const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&hr2));
+  const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&hr3));
+  const __nv_bfloat162 b0 = __floats2bfloat162_rn(f0.x * s0.x, f0.y * s0.y);
+  const __nv_bfloat162 b1 = __floats2bfloat162_rn(f1.x * s0.z, f1.y * s0.w);
+  const __nv_bfloat162 b2 = __floats2bfloat162_rn(f2.x * s1.x, f2.y * s1.y);
+  const __nv_bfloat162 b3 = __floats2bfloat162_rn(f3.x * s1.z, f3.y * s1.w);
+  return make_uint4(*reinterpret_cast<const uint32_t*>(&b0), *reinterpret_cast<const uint32_t*>(&b1),
+                    *reinterpret_cast<const uint32_t*>(&b2), *reinterpret_cast<const uint32_t*>(&b3));
+}
+
+template <int WMODE, bool MULTI_OUT>
+__global__ void __launch_bounds__(256)
+    DequantWeightBf16Kernel(const uint8_t* wq, const float* w_scale, DequantOutParams op, int K, int N, int row_stride, int col_offset) {
   const int chunks_per_row = N / 8;
   const int64_t total_chunks = static_cast<int64_t>(K) * chunks_per_row;
-  if (idx >= total_chunks) return;
-  const int r = static_cast<int>(idx / chunks_per_row);
-  const int col = static_cast<int>(idx % chunks_per_row) * 8;
-  uint4 u4;
-  if (w_mode == 1) {
-    u4 = skinny::LoadWeightsFp8AsBf16(wq + static_cast<size_t>(r) * N + col);
-  } else {
-    const size_t fp4_row_bytes = static_cast<size_t>(N) * 9 / 16;
-    u4 = skinny::LoadWeightsFp4AsBf16(wq + static_cast<size_t>(r) * fp4_row_bytes, N, col);
-  }
-  if (w_scale != nullptr) {
-    const uint32_t words_in[4] = {u4.x, u4.y, u4.z, u4.w};
-    uint32_t words_out[4];
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total_chunks;
+       idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int r = static_cast<int>(idx / chunks_per_row);
+    const int col = static_cast<int>(idx % chunks_per_row) * 8;
+    const int src_col = col_offset + col;
+    uint4 u4;
+    if constexpr (WMODE == 0) {
+      u4 = __ldg(reinterpret_cast<const uint4*>(reinterpret_cast<const bf16*>(wq) + static_cast<size_t>(r) * row_stride + src_col));
+    } else if constexpr (WMODE == 1) {
+      const uint2 raw = __ldg(reinterpret_cast<const uint2*>(wq + static_cast<size_t>(r) * row_stride + src_col));
+      u4 = DeqFp8x8ToBf16U4(raw, w_scale, col);
+    } else {
+      const size_t fp4_row_bytes = static_cast<size_t>(row_stride) * 9 / 16;
+      const uint8_t* row_p = wq + static_cast<size_t>(r) * fp4_row_bytes;
+      const uint32_t pack8 = __ldg(reinterpret_cast<const uint32_t*>(row_p + (src_col >> 1)));
+      const uint8_t s_fp8 = row_p[(row_stride >> 1) + (src_col >> 4)];
+      const __half_raw hr = __nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(s_fp8), __NV_E4M3);
+      const float s_half = __half2float(*reinterpret_cast<const __half*>(&hr)) * 0.5f;
+      const float4 s0 = w_scale ? __ldg(reinterpret_cast<const float4*>(w_scale + col)) : make_float4(1.f, 1.f, 1.f, 1.f);
+      const float4 s1 = w_scale ? __ldg(reinterpret_cast<const float4*>(w_scale + col + 4)) : make_float4(1.f, 1.f, 1.f, 1.f);
+      const float sc[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+      uint32_t words_out[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const float f0 = __uint_as_float(words_in[i] << 16) * w_scale[col + 2 * i];
-      const float f1 = __uint_as_float(words_in[i] & 0xffff0000u) * w_scale[col + 2 * i + 1];
-      const __nv_bfloat162 b = __floats2bfloat162_rn(f0, f1);
-      words_out[i] = *reinterpret_cast<const uint32_t*>(&b);
+      for (int i = 0; i < 4; ++i) {
+        const float f0 = skinny::E2M1ScaledToFloat((pack8 >> (8 * i)) & 0xfu, s_half) * sc[2 * i];
+        const float f1 = skinny::E2M1ScaledToFloat((pack8 >> (8 * i + 4)) & 0xfu, s_half) * sc[2 * i + 1];
+        const __nv_bfloat162 b = __floats2bfloat162_rn(f0, f1);
+        words_out[i] = *reinterpret_cast<const uint32_t*>(&b);
+      }
+      u4 = make_uint4(words_out[0], words_out[1], words_out[2], words_out[3]);
     }
-    u4 = make_uint4(words_out[0], words_out[1], words_out[2], words_out[3]);
+    if constexpr (!MULTI_OUT) {
+      *reinterpret_cast<uint4*>(op.out[0] + static_cast<size_t>(r) * N + col) = u4;
+    } else {
+      int j = 0;
+#pragma unroll
+      for (int i = 1; i < skinny::kMaxOut; ++i) {
+        if (i < op.num_outs && col >= op.col_begin[i]) j = i;
+      }
+      *reinterpret_cast<uint4*>(op.out[j] + static_cast<size_t>(r) * op.width[j] + (col - op.col_begin[j])) = u4;
+    }
   }
-  *reinterpret_cast<uint4*>(out + static_cast<size_t>(r) * N + col) = u4;
 }
 
 struct DequantWeightBf16KernelState {
   const OrtApi& api;
   int64_t n_cols = 0;
+  int64_t col_offset = 0;
+  std::vector<int> widths;
   float* d_w_scale = nullptr;
   size_t w_scale_len = 0;
 
   DequantWeightBf16KernelState(const OrtApi& a, const OrtKernelInfo* info) : api(a) {
     Ort::ConstKernelInfo k(info);
     n_cols = k.GetAttribute<int64_t>("n_cols");
+    try {
+      col_offset = k.GetAttribute<int64_t>("col_offset");
+    } catch (const std::exception&) {
+      col_offset = 0;
+    }
+    try {
+      for (auto v : k.GetAttributes<int64_t>("widths")) widths.push_back(static_cast<int>(v));
+    } catch (const std::exception&) {
+    }
+    if (widths.empty()) widths.push_back(static_cast<int>(n_cols));
+    int sum_w = 0;
+    for (int v : widths) {
+      if (v <= 0 || v % 8 != 0) throw std::invalid_argument("DequantWeightBf16: each width must be a positive multiple of 8");
+      sum_w += v;
+    }
+    if (sum_w != n_cols || widths.size() > skinny::kMaxOut || col_offset < 0 || col_offset % 8 != 0)
+      throw std::invalid_argument("DequantWeightBf16: invalid widths or col_offset");
     std::vector<float> scale_host;
     try {
       scale_host = k.GetAttributes<float>("w_scale");
@@ -490,21 +579,51 @@ struct DequantWeightBf16KernelState {
       const int64_t K = wshape[0];
       const int64_t N = n_cols;
       int w_mode = 0;
-      if (wtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN && wshape[1] == N) {
+      int row_stride = static_cast<int>(N);
+      if (wtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 && wshape[1] >= col_offset + N) {
+        w_mode = 0;
+        row_stride = static_cast<int>(wshape[1]);
+      } else if (wtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN && wshape[1] >= col_offset + N) {
         w_mode = 1;
-      } else if (wtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 && N % 16 == 0 && wshape[1] == (N * 9) / 16) {
+        row_stride = static_cast<int>(wshape[1]);
+      } else if (wtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 && N % 16 == 0 && col_offset % 16 == 0 &&
+                 wshape[1] * 16 >= (col_offset + N) * 9 && (wshape[1] * 16) % 9 == 0) {
         w_mode = 2;
+        row_stride = static_cast<int>((wshape[1] * 16) / 9);
       } else {
         throw std::invalid_argument("DequantWeightBf16: unsupported input type/shape");
       }
-      auto out = c.GetOutput(0, {K, N});
+      DequantOutParams op = {};
+      op.num_outs = static_cast<int>(widths.size());
+      int col_off = 0;
+      for (int i = 0; i < op.num_outs; ++i) {
+        auto out = c.GetOutput(i, {K, widths[i]});
+        op.out[i] = reinterpret_cast<bf16*>(out.GetTensorMutableData<Ort::BFloat16_t>());
+        op.col_begin[i] = col_off;
+        op.width[i] = widths[i];
+        col_off += widths[i];
+      }
       const int64_t total_chunks = K * (N / 8);
       const int threads = 256;
-      const int blocks = static_cast<int>((total_chunks + threads - 1) / threads);
-      DequantWeightBf16Kernel<<<blocks, threads, 0, Stream(api, raw)>>>(
-          static_cast<const uint8_t*>(w.GetTensorRawData()), d_w_scale,
-          reinterpret_cast<bf16*>(out.GetTensorMutableData<Ort::BFloat16_t>()),
-          static_cast<int>(K), static_cast<int>(N), w_mode);
+      const int blocks = static_cast<int>(std::min<int64_t>(8192, (total_chunks + threads - 1) / threads));
+      const uint8_t* wq_ptr = static_cast<const uint8_t*>(w.GetTensorRawData());
+      cudaStream_t stream = Stream(api, raw);
+      const int k_i = static_cast<int>(K), n_i = static_cast<int>(N), co_i = static_cast<int>(col_offset);
+      if (op.num_outs == 1) {
+        if (w_mode == 0)
+          DequantWeightBf16Kernel<0, false><<<blocks, threads, 0, stream>>>(wq_ptr, d_w_scale, op, k_i, n_i, row_stride, co_i);
+        else if (w_mode == 1)
+          DequantWeightBf16Kernel<1, false><<<blocks, threads, 0, stream>>>(wq_ptr, d_w_scale, op, k_i, n_i, row_stride, co_i);
+        else
+          DequantWeightBf16Kernel<2, false><<<blocks, threads, 0, stream>>>(wq_ptr, d_w_scale, op, k_i, n_i, row_stride, co_i);
+      } else {
+        if (w_mode == 0)
+          DequantWeightBf16Kernel<0, true><<<blocks, threads, 0, stream>>>(wq_ptr, d_w_scale, op, k_i, n_i, row_stride, co_i);
+        else if (w_mode == 1)
+          DequantWeightBf16Kernel<1, true><<<blocks, threads, 0, stream>>>(wq_ptr, d_w_scale, op, k_i, n_i, row_stride, co_i);
+        else
+          DequantWeightBf16Kernel<2, true><<<blocks, threads, 0, stream>>>(wq_ptr, d_w_scale, op, k_i, n_i, row_stride, co_i);
+      }
       cudaError_t err = cudaGetLastError();
       if (err != cudaSuccess) throw std::runtime_error(std::string("DequantWeightBf16: ") + cudaGetErrorString(err));
       return nullptr;
@@ -522,8 +641,11 @@ struct DequantWeightBf16Op : Ort::CustomOpBase<DequantWeightBf16Op, DequantWeigh
   OrtCustomOpInputOutputCharacteristic GetInputCharacteristic(size_t i) const {
     return i == 0 ? INPUT_OUTPUT_REQUIRED : INPUT_OUTPUT_OPTIONAL;
   }
-  size_t GetOutputTypeCount() const { return 1; }
+  size_t GetOutputTypeCount() const { return skinny::kMaxOut; }
   ONNXTensorElementDataType GetOutputType(size_t) const { return ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16; }
+  OrtCustomOpInputOutputCharacteristic GetOutputCharacteristic(size_t i) const {
+    return i == 0 ? INPUT_OUTPUT_REQUIRED : INPUT_OUTPUT_OPTIONAL;
+  }
   OrtStatus* CreateKernelV2(const OrtApi& api, const OrtKernelInfo* info, void** kernel) const noexcept {
     try {
       *kernel = new DequantWeightBf16KernelState(api, info);
@@ -534,10 +656,12 @@ struct DequantWeightBf16Op : Ort::CustomOpBase<DequantWeightBf16Op, DequantWeigh
   }
 };
 
-__global__ void UntileHcBf16Kernel(const uint4* src, uint4* dst, int kind) {
+template <bool FP8>
+__global__ void __launch_bounds__(256) UntileHcBf16Kernel(const uint4* src, uint4* dst, const float* w_scale, int kind) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= 204800) return;
   int dst_idx = 0;
+  int col0 = 0;
   if (kind == 0) {
     const int rp = idx & 127;
     const int t1 = idx >> 7;
@@ -546,6 +670,7 @@ __global__ void UntileHcBf16Kernel(const uint4* src, uint4* dst, int kind) {
     const int j = t2 % 20;
     const int s = t2 / 20;
     dst_idx = (((s * 10 + i) * 128 + rp) * 20 + j);
+    col0 = j * 16;
   } else {
     const int c = idx & 3;
     const int t1 = idx >> 2;
@@ -554,28 +679,66 @@ __global__ void UntileHcBf16Kernel(const uint4* src, uint4* dst, int kind) {
     const int i = t2 % 10;
     const int hb = t2 / 10;
     dst_idx = (((i * 32 + rp) * 4 + c) * 160 + hb);
+    col0 = (c * 160 + hb) * 16;
   }
-  dst[2 * dst_idx + 0] = src[2 * idx + 0];
-  dst[2 * dst_idx + 1] = src[2 * idx + 1];
+  if constexpr (!FP8) {
+    dst[2 * dst_idx + 0] = src[2 * idx + 0];
+    dst[2 * dst_idx + 1] = src[2 * idx + 1];
+  } else {
+    const uint4 raw16 = __ldg(src + idx);
+    dst[2 * dst_idx + 0] = DeqFp8x8ToBf16U4(make_uint2(raw16.x, raw16.y), w_scale, col0);
+    dst[2 * dst_idx + 1] = DeqFp8x8ToBf16U4(make_uint2(raw16.z, raw16.w), w_scale, col0 + 8);
+  }
 }
 
 struct UntileHcBf16KernelState {
   const OrtApi& api;
   int kind = 0;
+  float* d_w_scale = nullptr;
+  size_t w_scale_len = 0;
   UntileHcBf16KernelState(const OrtApi& a, const OrtKernelInfo* info) : api(a) {
-    kind = static_cast<int>(Ort::ConstKernelInfo(info).GetAttribute<int64_t>("kind"));
+    Ort::ConstKernelInfo k(info);
+    kind = static_cast<int>(k.GetAttribute<int64_t>("kind"));
+    std::vector<float> scale_host;
+    try {
+      scale_host = k.GetAttributes<float>("w_scale");
+    } catch (const std::exception&) {
+    }
+    if (!scale_host.empty()) {
+      w_scale_len = scale_host.size();
+      if (cudaMalloc(&d_w_scale, w_scale_len * sizeof(float)) != cudaSuccess ||
+          cudaMemcpy(d_w_scale, scale_host.data(), w_scale_len * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(d_w_scale);
+        d_w_scale = nullptr;
+        throw std::runtime_error("UntileHcBf16: failed to upload w_scale");
+      }
+    }
+  }
+  ~UntileHcBf16KernelState() {
+    cudaFree(d_w_scale);
   }
   OrtStatus* ComputeV2(OrtKernelContext* raw) noexcept {
     try {
       Ort::KernelContext c(raw);
       auto w = c.GetInput(0);
-      auto wshape = w.GetTensorTypeAndShapeInfo().GetShape();
+      auto winfo = w.GetTensorTypeAndShapeInfo();
+      auto wshape = winfo.GetShape();
+      const auto wtype = winfo.GetElementType();
       if (wshape != std::vector<int64_t>{160, 20480}) throw std::invalid_argument("UntileHcBf16: expected [160, 20480]");
       std::vector<int64_t> oshape = kind == 0 ? std::vector<int64_t>{10240, 320} : std::vector<int64_t>{320, 10240};
       auto out = c.GetOutput(0, oshape);
-      UntileHcBf16Kernel<<<800, 256, 0, Stream(api, raw)>>>(
-          reinterpret_cast<const uint4*>(w.GetTensorRawData()),
-          reinterpret_cast<uint4*>(out.GetTensorMutableRawData()), kind);
+      cudaStream_t stream = Stream(api, raw);
+      if (wtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16) {
+        UntileHcBf16Kernel<false><<<800, 256, 0, stream>>>(
+            reinterpret_cast<const uint4*>(w.GetTensorRawData()),
+            reinterpret_cast<uint4*>(out.GetTensorMutableRawData()), nullptr, kind);
+      } else if (wtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN) {
+        UntileHcBf16Kernel<true><<<800, 256, 0, stream>>>(
+            reinterpret_cast<const uint4*>(w.GetTensorRawData()),
+            reinterpret_cast<uint4*>(out.GetTensorMutableRawData()), d_w_scale, kind);
+      } else {
+        throw std::invalid_argument("UntileHcBf16: unsupported input element type");
+      }
       cudaError_t err = cudaGetLastError();
       if (err != cudaSuccess) throw std::runtime_error(std::string("UntileHcBf16: ") + cudaGetErrorString(err));
       return nullptr;
@@ -589,7 +752,7 @@ struct UntileHcBf16Op : Ort::CustomOpBase<UntileHcBf16Op, UntileHcBf16KernelStat
   const char* GetName() const { return "UntileHcBf16"; }
   const char* GetExecutionProviderType() const { return "CUDAExecutionProvider"; }
   size_t GetInputTypeCount() const { return 2; }
-  ONNXTensorElementDataType GetInputType(size_t) const { return ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16; }
+  ONNXTensorElementDataType GetInputType(size_t) const { return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED; }
   OrtCustomOpInputOutputCharacteristic GetInputCharacteristic(size_t i) const {
     return i == 0 ? INPUT_OUTPUT_REQUIRED : INPUT_OUTPUT_OPTIONAL;
   }

@@ -1,9 +1,10 @@
 // Fused BF16 pointwise decode ops for the Qwen3.8 S=1 capture graph.
-// Every op rounds to BF16 at the same points as the unfused ONNX chain.
+// Every op rounds to BF16 at the same points as the unfused ONNX chain (ORT Sigmoid = accurate BF16 sigmoid of provider commit 453ac97a68; Swish = Mul(x, Sigmoid(x))).
 #ifndef ORT_API_MANUAL_INIT
 #define ORT_API_MANUAL_INIT
 #endif
 #include "onnxruntime_cxx_api.h"
+#include "common/sigmoid_acc.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -66,13 +67,18 @@ __global__ void SwishMulKernel(const bf16* g, const bf16* u, bf16* y, int64_t n)
   y[i] = __float2bfloat16(s * __bfloat162float(u[i]));
 }
 
-// logit = bf16(dot(x, w)); y = bf16(routed + bf16(shared * bf16(sigmoid(logit))))
+// logit = bf16(dot(x[r], w)); y[r] = bf16(routed[r] + bf16(shared[r] * bf16(sigmoid(logit))))
 __global__ void SharedGateMulAddKernel(
-    const bf16* x, const bf16* w, const bf16* shared, const bf16* routed, bf16* y, int k, int n) {
+    const bf16* x, const bf16* w, const bf16* shared, const bf16* routed, bf16* y, int k, int cols) {
+  const int row = blockIdx.y;
+  const bf16* xr = x + static_cast<int64_t>(row) * k;
+  const bf16* sr = shared + static_cast<int64_t>(row) * cols;
+  const bf16* rr = routed + static_cast<int64_t>(row) * cols;
+  bf16* yr = y + static_cast<int64_t>(row) * cols;
   __shared__ float partial[32];
   float sum = 0.0f;
   for (int i = threadIdx.x; i < k; i += blockDim.x) {
-    sum += __bfloat162float(x[i]) * __bfloat162float(w[i]);
+    sum += __bfloat162float(xr[i]) * __bfloat162float(w[i]);
   }
   for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xffffffff, sum, offset);
   if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = sum;
@@ -84,9 +90,9 @@ __global__ void SharedGateMulAddKernel(
   }
   __syncthreads();
   const float gate = R(Sigmoid(R(partial[0])));
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
-    float s = R(__bfloat162float(shared[i]) * gate);
-    y[i] = __float2bfloat16(__bfloat162float(routed[i]) + s);
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < cols; i += gridDim.x * blockDim.x) {
+    float s = R(__bfloat162float(sr[i]) * gate);
+    yr[i] = __float2bfloat16(__bfloat162float(rr[i]) + s);
   }
 }
 
@@ -143,14 +149,18 @@ struct SharedGateMulAddKernelState {
       auto shared = c.GetInput(2);
       auto shape = shared.GetTensorTypeAndShapeInfo().GetShape();
       int64_t n = Count(shared);
-      int64_t k = Count(c.GetInput(0));
-      if (Count(c.GetInput(1)) != k || Count(c.GetInput(3)) != n) {
+      int64_t k = Count(c.GetInput(1));
+      int64_t x_cnt = Count(c.GetInput(0));
+      int64_t rows = k > 0 ? x_cnt / k : 0;
+      int64_t cols = rows > 0 ? n / rows : 0;
+      if (rows < 1 || x_cnt != rows * k || cols * rows != n || Count(c.GetInput(3)) != n) {
         throw std::invalid_argument("SharedGateMulAdd: shape mismatch");
       }
       auto out = c.GetOutput(0, shape);
-      int blocks = static_cast<int>(std::min<int64_t>((n + 255) / 256, 16));
-      SharedGateMulAddKernel<<<blocks, 256, 0, Stream(api, raw)>>>(
-          In(c, 0), In(c, 1), In(c, 2), In(c, 3), Out(out), static_cast<int>(k), static_cast<int>(n));
+      int blocks_x = rows == 1 ? static_cast<int>(std::min<int64_t>((cols + 255) / 256, 16)) : 1;
+      dim3 grid(blocks_x, static_cast<unsigned>(rows));
+      SharedGateMulAddKernel<<<grid, 256, 0, Stream(api, raw)>>>(
+          In(c, 0), In(c, 1), In(c, 2), In(c, 3), Out(out), static_cast<int>(k), static_cast<int>(cols));
       CheckLaunch();
       return nullptr;
     } catch (const std::exception& e) {

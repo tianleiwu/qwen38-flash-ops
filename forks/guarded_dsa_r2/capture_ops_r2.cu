@@ -219,17 +219,15 @@ struct GuardedKernel {
       data.row_chain = row_chain ? params.sequence_length : 1;
       int32_t* flags = row_chain ? row_errors : error;
       data.validation_error = flags;
+      data.composite_error = row_chain ? error : nullptr;
+      const int32_t* committed_ptr = context.GetInput(8).GetTensorData<int32_t>();
       void* raw_stream = nullptr;
       Ort::ThrowOnError(api.KernelContext_GetGPUComputeStream(raw_context, &raw_stream));
       auto stream = static_cast<cudaStream_t>(raw_stream);
       auto status = native::ValidateDynamicSparseAttentionOnDevice(stream, data.selected_indices,
           data.selected_counts, data.seqlens_k, nullptr, params, flags, bitmap,
-          properties.sharedMemPerBlock, false, row_chain);
+          properties.sharedMemPerBlock, false, row_chain, committed_ptr);
       if (!status.IsOK()) return api.CreateStatus(ORT_FAIL, status.ErrorMessage().c_str());
-      CheckCursorKernel<<<1, 1, 0, stream>>>(data.seqlens_k,
-          context.GetInput(8).GetTensorData<int32_t>(), params.sequence_length, params.cache_capacity, flags,
-          row_chain ? error : nullptr);
-      CheckCuda(cudaGetLastError());
       status = native::LaunchDynamicSparseAttention<__nv_bfloat16>(stream, params, data, false, false,
           properties.maxThreadsPerBlock, properties.sharedMemPerBlock);
       if (!status.IsOK()) return api.CreateStatus(ORT_FAIL, status.ErrorMessage().c_str());

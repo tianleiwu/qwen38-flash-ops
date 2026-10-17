@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "source_tree_sha256": "a8df3d35fb24c4bb294d7b785c7fb9ffc30114780c7c6a50ad384274ab440eda",
+  "source_tree_sha256": "ae9aa0f54c30b2752a247c29dc271586b957d9f1e30ffed02f4b992b66d5c59d",
   "toolchain": {
-    "nvcc": null,
+    "nvcc": "Cuda compilation tools, release 13.0, V13.0.48",
     "cxx": "c++ (GCC) 13.2.0"
   },
   "libraries": {
@@ -14,11 +14,11 @@
         "SharedGateMulAdd"
       ],
       "built": true,
-      "sha256": "06eb6f301db567612791e8503414d9b94904b359424c7ab538ea2404ac167076",
+      "sha256": "50df51ca3d7a7e0801572c55f321648e8eefb63f947046fa2e5bb33b0e74d6cb",
       "size": 1057992,
       "shipped_reference_sha256": "45d8cca6ec31509916baefb999961010707c3936c9a913c9e3641061d18486ac",
       "sources": {
-        "src/fused_ops/fused_ops.cu": "1c7c682bfa064672a3a87a40370baaff0b0be4bd7c9e702f4c774e6cff53e7e4"
+        "src/fused_ops/fused_ops.cu": "4e36ae39576d73fcc66c2694bfce3e12962f856e34a8d10eb5a1f038c759c633"
       }
     },
     "libqwen_fused_attn_r5.so": {
@@ -54,11 +54,11 @@
         "HcMixUp"
       ],
       "built": true,
-      "sha256": "bd2503fd5dde77644799981dcee53242e48502c7961c420479d2d3bed19fcbbd",
-      "size": 1785536,
+      "sha256": "0e957747ef0bbb1eddcbd1c20e58d1ec97d5611b10196bc4fe1ce6f177e7ef86",
+      "size": 2051448,
       "shipped_reference_sha256": "058dde98daa4bc9afc3bce6f763f965ef45708d1e168275d2bf206b127bf8e27",
       "sources": {
-        "src/fused_hc/fused_hc_r5.cu": "24afb5de758299f12233d50f5b150c4eb2fafd0a4dff4ee68091637408109daa",
+        "src/fused_hc/fused_hc_r5.cu": "68197b77ab885b2245353ca61624b191fdd0dac2397ead805e918ec1dd73e61e",
         "src/common/sigmoid_acc.cuh": "84230fd26491115cb4eb996f84f3b461ad5fa525a3b8e7d6aad26730b0ac9309"
       }
     },
@@ -72,12 +72,12 @@
         "UntileHcBf16"
       ],
       "built": true,
-      "sha256": "7e814daf1a794e876561371b3d85a1078203e621bd17fc7818ebe71e924c0858",
-      "size": 8122880,
+      "sha256": "984f5a9f1339e74c26b5c5cfd93f5c76dfecbb4d5b2eb876d8a0102199e5e4ed",
+      "size": 5886184,
       "shipped_reference_sha256": "059d78c4859b8347f174f7865b6a15650378a9c6b74c524ee185ef986ab1979f",
       "sources": {
-        "src/fused_gemm/fused_gemm.cu": "6ff71ee8f0bf3c743a640f34aa6dbf99877c0d87304f6582f51cd52e6c633cdd",
-        "src/fused_gemm/skinny_gemm.cuh": "d5365775677e41c0093e7c6596cda65be018a37b9a25cc8444932ef50af3899d",
+        "src/fused_gemm/fused_gemm.cu": "db8a8104fd4ea0ec6a0afa8d6eae7e87cb040897f8bc4f6a1be3c1027ad7f94c",
+        "src/fused_gemm/skinny_gemm.cuh": "a21f9acf8b924ab51400baccef231f1217e846d4211a6cd8c3a12c128d51b219",
         "src/fused_gemm/argmax_rows.cuh": "a91d9c542c9c65bae999c49fcb902273ff02824d72c83aae4322f006308e8e15",
         "src/common/sigmoid_acc.cuh": "84230fd26491115cb4eb996f84f3b461ad5fa525a3b8e7d6aad26730b0ac9309"
       }
@@ -106,11 +106,11 @@
         "MtpMoe"
       ],
       "built": true,
-      "sha256": "9b2e2d6fc06981178a2cc4c63735104d57a5b0bdb2a31d576bdf884b2e34e4fc",
-      "size": 1219744,
+      "sha256": "2cf8aaa6cb00615bdced03370b48db5b48ae5cf157b722f0f929bba79d2efcaa",
+      "size": 1289376,
       "shipped_reference_sha256": "8e7f0105b476a878d63445ec26f68078cac811b260727a8a02b950853e41bf59",
       "sources": {
-        "src/mtp_head/qwen_mtp_ops.cu": "ef51594d696385d1cba4dfc6386fde320c4091f3b8fce24d75272ac9237672cd"
+        "src/mtp_head/qwen_mtp_ops.cu": "c90ba180b9bd147e5972188f5462063eab6103ab8246c40375e0d71b69f30c62"
       }
     },
     "libqwen_guarded_dsa_r2_v12.so": {
@@ -119,13 +119,13 @@
         "GuardedDSA"
       ],
       "built": true,
-      "sha256": "4ed9a2a1cd75ee3c21d60482d8ccd5361ddadb0a70768b0ca41af22dc5e3c7ed",
-      "size": 4321080,
+      "sha256": "b43e9a9d5827700b9b086b9a12a47015dad9f898337cd13a01d29e017ae5c19c",
+      "size": 4381288,
       "shipped_reference_sha256": "02354458f5e734f01586792ad7ea7b49ddcb906d62ecf695bb1cc3538af76ec3",
       "sources": {
-        "forks/guarded_dsa_r2/capture_ops_r2.cu": "f8d7fc4c087c5906c6338feda46dbe40f6743b4c72b6a986b9ea6e3453aa5b08",
-        "forks/guarded_dsa_r2/guarded_dsa_r2.cu": "7026b8f7b033e6ee71a56974b98342f4c74d5a47f891e4ce7852f78d56b396be",
-        "forks/guarded_dsa_r2/private_dsa.h": "5f5e982b0fe3cd8058899b9e580db1366d160dc3596df2c4ad742a849b2497cb",
+        "forks/guarded_dsa_r2/capture_ops_r2.cu": "d3e0904d54e2f31aaf078910af684736b0b7ede403a82305330796fd504d3449",
+        "forks/guarded_dsa_r2/guarded_dsa_r2.cu": "d298f67ef4304b47f69afdd43955618b2501369a8c83a40efc53fbdffdf75861",
+        "forks/guarded_dsa_r2/private_dsa.h": "19737e760462f4d3d1c0812d31b93a0ea0235438ab27c7bf5ee935b8a6ac355a",
         "forks/guarded_dsa_r2/cuda_runtime_status.cc": "0c3db9a00e881f0ac36916f096b1b66731c4243b1834aca3cbb57b0fbb854559",
         "forks/guarded_dsa_r2/guarded.exports": "8b3185e3ffeb3583d0ee8da282fb6f69f4a5d5fb9923ba5a448be3cd04126984"
       }

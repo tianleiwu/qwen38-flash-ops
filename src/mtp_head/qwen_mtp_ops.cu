@@ -94,10 +94,13 @@ __device__ __forceinline__ float E2M1ToFloat(uint32_t nib) {
 }
 
 __device__ __forceinline__ void UnpackFp4(uint32_t pack8, uint8_t scale_fp8, float* f) {
-  const float s = Fp8ByteToFloat(scale_fp8);
+  const float s_half = Fp8ByteToFloat(scale_fp8) * 0.5f;
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    f[i] = E2M1ToFloat((pack8 >> (4 * i)) & 0xfu) * s;
+    const uint32_t nib = (pack8 >> (4 * i)) & 0xfu;
+    const uint32_t mag2 = (0xC8643210u >> ((nib & 7u) * 4u)) & 0xfu;
+    const float v = static_cast<float>(mag2) * s_half;
+    f[i] = __uint_as_float(__float_as_uint(v) ^ ((nib & 8u) << 28));
   }
 }
 
@@ -322,74 +325,92 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32)
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   float* base = scratch + static_cast<int64_t>(row) * kScratchStride;
   const int expert = __float_as_int(base[slot]);
-  const int j = blockIdx.x * kWarpsPerBlock + warp;
+  const int j0 = (blockIdx.x * kWarpsPerBlock + warp) * 2;
   const uint4* xv = reinterpret_cast<const uint4*>(x + static_cast<int64_t>(row) * kHidden);
-  const uint8_t* rg = gate_up + (static_cast<int64_t>(expert) * kGateUp + j) * kRowBytes;
-  const uint8_t* ru = gate_up + (static_cast<int64_t>(expert) * kGateUp + kFfn + j) * kRowBytes;
+  const uint8_t* rg0 = gate_up + (static_cast<int64_t>(expert) * kGateUp + j0) * kRowBytes;
+  const uint8_t* rg1 = rg0 + kRowBytes;
+  const uint8_t* ru0 = gate_up + (static_cast<int64_t>(expert) * kGateUp + kFfn + j0) * kRowBytes;
+  const uint8_t* ru1 = ru0 + kRowBytes;
   uint4 xr[kPerLane];
-  float acc_g = 0.0f, acc_u = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kPerLane; ++i) {
+    xr[i] = __ldg(xv + i * 32 + lane);
+  }
+  float acc_g0 = 0.0f, acc_u0 = 0.0f, acc_g1 = 0.0f, acc_u1 = 0.0f;
   if constexpr (MODE == 1) {
-    uint2 g2[kPerLane], u2[kPerLane];
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) {
       const int c = i * 32 + lane;
-      g2[i] = __ldg(reinterpret_cast<const uint2*>(rg) + c);
-      u2[i] = __ldg(reinterpret_cast<const uint2*>(ru) + c);
-      xr[i] = __ldg(xv + c);
-    }
-#pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-      float fg[8], fu[8], fx[8];
-      UnpackFp8(g2[i], fg);
-      UnpackFp8(u2[i], fu);
+      const uint2 g20 = __ldg(reinterpret_cast<const uint2*>(rg0) + c);
+      const uint2 u20 = __ldg(reinterpret_cast<const uint2*>(ru0) + c);
+      const uint2 g21 = __ldg(reinterpret_cast<const uint2*>(rg1) + c);
+      const uint2 u21 = __ldg(reinterpret_cast<const uint2*>(ru1) + c);
+      float fg0[8], fu0[8], fg1[8], fu1[8], fx[8];
+      UnpackFp8(g20, fg0);
+      UnpackFp8(u20, fu0);
+      UnpackFp8(g21, fg1);
+      UnpackFp8(u21, fu1);
       Unpack(xr[i], fx);
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
-        acc_g = fmaf(fg[k], fx[k], acc_g);
-        acc_u = fmaf(fu[k], fx[k], acc_u);
+        acc_g0 = fmaf(fg0[k], fx[k], acc_g0);
+        acc_u0 = fmaf(fu0[k], fx[k], acc_u0);
+        acc_g1 = fmaf(fg1[k], fx[k], acc_g1);
+        acc_u1 = fmaf(fu1[k], fx[k], acc_u1);
       }
     }
   } else {
-    uint32_t g4[kPerLane], u4[kPerLane];
-    uint8_t gs[kPerLane], us[kPerLane];
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) {
       const int c = i * 32 + lane;
-      g4[i] = __ldg(reinterpret_cast<const uint32_t*>(rg) + c);
-      u4[i] = __ldg(reinterpret_cast<const uint32_t*>(ru) + c);
-      gs[i] = __ldg(rg + (kHidden / 2) + (c >> 1));
-      us[i] = __ldg(ru + (kHidden / 2) + (c >> 1));
-      xr[i] = __ldg(xv + c);
-    }
-#pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-      float fg[8], fu[8], fx[8];
-      UnpackFp4(g4[i], gs[i], fg);
-      UnpackFp4(u4[i], us[i], fu);
+      const uint32_t g40 = __ldg(reinterpret_cast<const uint32_t*>(rg0) + c);
+      const uint32_t u40 = __ldg(reinterpret_cast<const uint32_t*>(ru0) + c);
+      const uint32_t g41 = __ldg(reinterpret_cast<const uint32_t*>(rg1) + c);
+      const uint32_t u41 = __ldg(reinterpret_cast<const uint32_t*>(ru1) + c);
+      const uint8_t gs0 = __ldg(rg0 + (kHidden / 2) + (c >> 1));
+      const uint8_t us0 = __ldg(ru0 + (kHidden / 2) + (c >> 1));
+      const uint8_t gs1 = __ldg(rg1 + (kHidden / 2) + (c >> 1));
+      const uint8_t us1 = __ldg(ru1 + (kHidden / 2) + (c >> 1));
+      float fg0[8], fu0[8], fg1[8], fu1[8], fx[8];
+      UnpackFp4(g40, gs0, fg0);
+      UnpackFp4(u40, us0, fu0);
+      UnpackFp4(g41, gs1, fg1);
+      UnpackFp4(u41, us1, fu1);
       Unpack(xr[i], fx);
 #pragma unroll
       for (int k = 0; k < 8; ++k) {
-        acc_g = fmaf(fg[k], fx[k], acc_g);
-        acc_u = fmaf(fu[k], fx[k], acc_u);
+        acc_g0 = fmaf(fg0[k], fx[k], acc_g0);
+        acc_u0 = fmaf(fu0[k], fx[k], acc_u0);
+        acc_g1 = fmaf(fg1[k], fx[k], acc_g1);
+        acc_u1 = fmaf(fu1[k], fx[k], acc_u1);
       }
     }
   }
   for (int offset = 16; offset > 0; offset >>= 1) {
-    acc_g += __shfl_xor_sync(0xffffffffu, acc_g, offset);
-    acc_u += __shfl_xor_sync(0xffffffffu, acc_u, offset);
+    acc_g0 += __shfl_xor_sync(0xffffffffu, acc_g0, offset);
+    acc_u0 += __shfl_xor_sync(0xffffffffu, acc_u0, offset);
+    acc_g1 += __shfl_xor_sync(0xffffffffu, acc_g1, offset);
+    acc_u1 += __shfl_xor_sync(0xffffffffu, acc_u1, offset);
   }
   if (lane == 0) {
     if constexpr (MODE == 1) {
-      acc_g *= *reinterpret_cast<const float*>(rg + kHidden);
-      acc_u *= *reinterpret_cast<const float*>(ru + kHidden);
+      acc_g0 *= *reinterpret_cast<const float*>(rg0 + kHidden);
+      acc_u0 *= *reinterpret_cast<const float*>(ru0 + kHidden);
+      acc_g1 *= *reinterpret_cast<const float*>(rg1 + kHidden);
+      acc_u1 *= *reinterpret_cast<const float*>(ru1 + kHidden);
     } else {
-      acc_g *= global_scale;
-      acc_u *= global_scale;
+      acc_g0 *= global_scale;
+      acc_u0 *= global_scale;
+      acc_g1 *= global_scale;
+      acc_u1 *= global_scale;
     }
-    const float gv = R(acc_g);
-    const float uv = R(acc_u);
-    const float s = R(gv * Sigmoid(gv));
-    reinterpret_cast<bf16*>(base + 32)[slot * kFfn + j] = __float2bfloat16(s * uv);
+    const float gv0 = R(acc_g0), uv0 = R(acc_u0);
+    const float gv1 = R(acc_g1), uv1 = R(acc_u1);
+    const float s0 = R(gv0 * Sigmoid(gv0));
+    const float s1 = R(gv1 * Sigmoid(gv1));
+    bf16* dst = reinterpret_cast<bf16*>(base + 32) + slot * kFfn + j0;
+    dst[0] = __float2bfloat16(s0 * uv0);
+    dst[1] = __float2bfloat16(s1 * uv1);
   }
 }
 
@@ -445,70 +466,82 @@ __global__ void __launch_bounds__(kTopK * 32)
   constexpr int kRowBytes = MODE == 1 ? (kFfn + 16) : (kFfn * 9 / 16);
   const int row = blockIdx.y;
   const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int i = blockIdx.x;
+  const int i0 = blockIdx.x * 4;
   const float* base = scratch + static_cast<int64_t>(row) * kScratchStride;
   const int expert = __float_as_int(base[k]);
-  const uint8_t* rw = down + (static_cast<int64_t>(expert) * kHidden + i) * kRowBytes;
+  const uint8_t* rw0 = down + (static_cast<int64_t>(expert) * kHidden + i0) * kRowBytes;
   const uint4* h = reinterpret_cast<const uint4*>(reinterpret_cast<const bf16*>(base + 32) + k * kFfn);
-  float sum = 0.0f;
+  float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   uint4 hv[kDownPerLane];
-  if constexpr (MODE == 1) {
-    uint2 w2[kDownPerLane];
 #pragma unroll
-    for (int t = 0; t < kDownPerLane; ++t) {
-      const int c = t * 32 + lane;
-      w2[t] = c < kDownChunks ? __ldg(reinterpret_cast<const uint2*>(rw) + c) : make_uint2(0, 0);
-      hv[t] = c < kDownChunks ? h[c] : make_uint4(0, 0, 0, 0);
-    }
+  for (int t = 0; t < kDownPerLane; ++t) {
+    const int c = t * 32 + lane;
+    hv[t] = c < kDownChunks ? __ldg(h + c) : make_uint4(0, 0, 0, 0);
+  }
+  if constexpr (MODE == 1) {
 #pragma unroll
     for (int t = 0; t < kDownPerLane; ++t) {
       const int c = t * 32 + lane;
       if (c < kDownChunks) {
-        float fw[8], fh[8];
-        UnpackFp8(w2[t], fw);
+        float fh[8];
         Unpack(hv[t], fh);
 #pragma unroll
-        for (int e = 0; e < 8; ++e) sum = fmaf(fw[e], fh[e], sum);
+        for (int col = 0; col < 4; ++col) {
+          const uint2 w2 = __ldg(reinterpret_cast<const uint2*>(rw0 + col * kRowBytes) + c);
+          float fw[8];
+          UnpackFp8(w2, fw);
+#pragma unroll
+          for (int e = 0; e < 8; ++e) sum[col] = fmaf(fw[e], fh[e], sum[col]);
+        }
       }
     }
   } else {
-    uint32_t w4[kDownPerLane];
-    uint8_t ws[kDownPerLane];
-#pragma unroll
-    for (int t = 0; t < kDownPerLane; ++t) {
-      const int c = t * 32 + lane;
-      w4[t] = c < kDownChunks ? __ldg(reinterpret_cast<const uint32_t*>(rw) + c) : 0u;
-      ws[t] = c < kDownChunks ? __ldg(rw + (kFfn / 2) + (c >> 1)) : 0u;
-      hv[t] = c < kDownChunks ? h[c] : make_uint4(0, 0, 0, 0);
-    }
 #pragma unroll
     for (int t = 0; t < kDownPerLane; ++t) {
       const int c = t * 32 + lane;
       if (c < kDownChunks) {
-        float fw[8], fh[8];
-        UnpackFp4(w4[t], ws[t], fw);
+        float fh[8];
         Unpack(hv[t], fh);
 #pragma unroll
-        for (int e = 0; e < 8; ++e) sum = fmaf(fw[e], fh[e], sum);
+        for (int col = 0; col < 4; ++col) {
+          const uint8_t* rw = rw0 + col * kRowBytes;
+          const uint32_t w4 = __ldg(reinterpret_cast<const uint32_t*>(rw) + c);
+          const uint8_t ws = __ldg(rw + (kFfn / 2) + (c >> 1));
+          float fw[8];
+          UnpackFp4(w4, ws, fw);
+#pragma unroll
+          for (int e = 0; e < 8; ++e) sum[col] = fmaf(fw[e], fh[e], sum[col]);
+        }
       }
     }
   }
-  for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, offset);
-  __shared__ float weighted[kTopK];
-  if (lane == 0) {
-    if constexpr (MODE == 1) {
-      sum *= *reinterpret_cast<const float*>(rw + kFfn);
-    } else {
-      sum *= global_scale;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+#pragma unroll
+    for (int col = 0; col < 4; ++col) {
+      sum[col] += __shfl_xor_sync(0xffffffffu, sum[col], offset);
     }
-    weighted[k] = R(R(sum) * base[kTopK + k]);
+  }
+  __shared__ float weighted[kTopK][4];
+  if (lane == 0) {
+    const float w_k = base[kTopK + k];
+#pragma unroll
+    for (int col = 0; col < 4; ++col) {
+      float s = sum[col];
+      if constexpr (MODE == 1) {
+        s *= *reinterpret_cast<const float*>(rw0 + col * kRowBytes + kFfn);
+      } else {
+        s *= global_scale;
+      }
+      weighted[k][col] = R(R(s) * w_k);
+    }
   }
   __syncthreads();
-  if (threadIdx.x == 0) {
+  if (threadIdx.x < 4) {
+    const int col = threadIdx.x;
     float total = 0.0f;
 #pragma unroll
-    for (int e = 0; e < kTopK; ++e) total += weighted[e];
-    out[static_cast<int64_t>(row) * kHidden + i] = __float2bfloat16(total);
+    for (int e = 0; e < kTopK; ++e) total += weighted[e][col];
+    out[static_cast<int64_t>(row) * kHidden + i0 + col] = __float2bfloat16(total);
   }
 }
 
@@ -593,18 +626,18 @@ struct MoeState {
             reinterpret_cast<bf16*>(out.GetTensorMutableData<Ort::BFloat16_t>()));
       } else if (wtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 && gu_shape[2] == kHidden + 16 &&
                  dn_shape[2] == kFfn + 16) {
-        GateUpQuantKernel<1><<<dim3(kFfn / kWarpsPerBlock, kTopK, static_cast<unsigned>(rows)), kWarpsPerBlock * 32, 0, stream>>>(
+        GateUpQuantKernel<1><<<dim3(kFfn / (kWarpsPerBlock * 2), kTopK, static_cast<unsigned>(rows)), kWarpsPerBlock * 32, 0, stream>>>(
             reinterpret_cast<const bf16*>(x.GetTensorData<Ort::BFloat16_t>()),
             static_cast<const uint8_t*>(gate_up.GetTensorRawData()), scratch_ptr, 1.0f);
-        DownQuantKernel<1><<<dim3(kHidden, static_cast<unsigned>(rows)), kTopK * 32, 0, stream>>>(
+        DownQuantKernel<1><<<dim3(kHidden / 4, static_cast<unsigned>(rows)), kTopK * 32, 0, stream>>>(
             static_cast<const uint8_t*>(down.GetTensorRawData()), scratch_ptr,
             reinterpret_cast<bf16*>(out.GetTensorMutableData<Ort::BFloat16_t>()), 1.0f);
       } else if (wtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 && gu_shape[2] == (kHidden * 9) / 16 &&
                  dn_shape[2] == (kFfn * 9) / 16) {
-        GateUpQuantKernel<2><<<dim3(kFfn / kWarpsPerBlock, kTopK, static_cast<unsigned>(rows)), kWarpsPerBlock * 32, 0, stream>>>(
+        GateUpQuantKernel<2><<<dim3(kFfn / (kWarpsPerBlock * 2), kTopK, static_cast<unsigned>(rows)), kWarpsPerBlock * 32, 0, stream>>>(
             reinterpret_cast<const bf16*>(x.GetTensorData<Ort::BFloat16_t>()),
             static_cast<const uint8_t*>(gate_up.GetTensorRawData()), scratch_ptr, gate_up_global_scale);
-        DownQuantKernel<2><<<dim3(kHidden, static_cast<unsigned>(rows)), kTopK * 32, 0, stream>>>(
+        DownQuantKernel<2><<<dim3(kHidden / 4, static_cast<unsigned>(rows)), kTopK * 32, 0, stream>>>(
             static_cast<const uint8_t*>(down.GetTensorRawData()), scratch_ptr,
             reinterpret_cast<bf16*>(out.GetTensorMutableData<Ort::BFloat16_t>()), down_global_scale);
       } else {

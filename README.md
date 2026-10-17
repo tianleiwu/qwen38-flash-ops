@@ -46,8 +46,8 @@ value/launch-tag table); other layouts use the two-kernel `HcDown`/`HcUpPre` pat
 
 | op | inputs -> outputs |
 | --- | --- |
-| `HcBlock` | streams, norm_w, w_down, w_inject, w_up -> pre, gate, scratch (fp32) |
-| `HcPostBlock` | streams, branch, gate, norm_w, w_down, w_inject, w_up -> streams_out, pre, gate, scratch |
+| `HcBlock` | streams, norm_w, w_down, w_inject, w_up -> pre, gate, scratch (fp32). Supports BF16 and per-column FP8 E4M3FN (`wd_scale`, `wu_scale` attributes) `[160, 20480]` tiled `w_down` / `w_up` |
+| `HcPostBlock` | streams, branch, gate, norm_w, w_down, w_inject, w_up -> streams_out, pre, gate, scratch. Supports BF16 and per-column FP8 E4M3FN (`wd_scale`, `wu_scale` attributes) `[160, 20480]` tiled `w_down` / `w_up` |
 | `HcDown` / `HcPostDown` | down GEMV (K-split partials to a scratch row) of a block / of the post-mix + next block -> scratch (and streams_out) |
 | `HcUpPre` | up phase: scratch + inputs -> pre, gate |
 | `HcMixDown`, `HcMixPostDown`, `HcMixUp` | the final hyper_connection_mixer: same kernels without the inject/gate branch |
@@ -60,8 +60,8 @@ Debug environment variables read by the library: `HC_PDL`, `HC_MERGE`, `HC_EARLY
 | `SkinnyGemm` | Decode GEMV/GEMM, M <= 4 rows; `x [...,K] @ W_i [K,N_i]` for g weights, writing each split slice directly to its own output (attributes `seg_outs`, `widths`, optional `trigger` for programmatic dependent launch, optional per-column `w_scale`). Supports BF16 `[K,N]`, FP8 E4M3FN `[K,N]`, and block-16 NVFP4 `UINT8 [K, N*9/16]` weights. FP32 accumulation, fixed reduction order; row r of an M-row call is bit-identical to the M=1 result |
 | `SharedExpertDown` | `y = routed + bf16(bf16(swish_mul(g,u) @ W) * bf16(sigmoid(bf16(dot(gx, gw)))))` per row, M in [1,4] (6 inputs -> 1 output); supports BF16, FP8 E4M3FN, and NVFP4 `W` (optional `w_scale` attribute) |
 | `ArgmaxRows` | `idx[...] = argmax over the last axis` of BF16/FP16/FP32 logits (numpy semantics: lowest index on ties, first NaN wins); optional 2nd output: the maximum as FP32 |
-| `DequantWeightBf16` | Dequantizes an FP8 E4M3FN `[K,N]` or block-16 NVFP4 `UINT8 [K, N*9/16]` weight tensor (with `n_cols` and `w_scale` attributes, plus optional second input `x` to tie buffer lifetime to the consuming `MatMul`) into `[K,N]` BF16 |
-| `UntileHcBf16` | Losslessly untiles `[160, 20480]` pre-tiled hyper-connection weights (`hc_tiled.data`) into `[10240, 320]` (`kind=0`) or `[320, 10240]` (`kind=1`) BF16 so the dense prefill graph can share `hc_tiled.data` with the decode graph |
+| `DequantWeightBf16` | Dequantizes an FP8 E4M3FN `[K,N]` or block-16 NVFP4 `UINT8 [K, N*9/16]` weight tensor (with `n_cols`, optional `col_offset`, optional `widths`, and `w_scale` attributes, plus optional second input `x` to tie buffer lifetime to the consuming `MatMul`) into `[K,N]` BF16 |
+| `UntileHcBf16` | Untiles (and optionally dequantizes from FP8 E4M3FN with `w_scale`) `[160, 20480]` pre-tiled hyper-connection weights (`hc_tiled.data`) into `[10240, 320]` (`kind=0`) or `[320, 10240]` (`kind=1`) BF16 so the dense prefill and head-KV graphs share `hc_tiled.data` with the decode graph |
 
 ### `qwen.fused` (`src/fused_ops/fused_ops.cu`)
 Pointwise BF16 fusions: `DivSigmoidMul` (`y = bf16(bf16(sigmoid(bf16(x / div))) * mul)`), `SwishMul` (`y = bf16(bf16(silu(g)) * u)`),

@@ -282,17 +282,72 @@ def test_skinny_gemm_and_dequant_and_untile(lib):
     y_ref = (x.float() @ ref_deq.float()).bfloat16()
     assert ((y_fp8.float() - y_ref.float()).norm() / y_ref.float().norm()).item() < 0.01, "SkinnyGemm FP8 error too high"
 
-    # UntileHcBf16 kind=0 ([160, 20480] -> [10240, 320])
+    # UntileHcBf16 kind=0 ([160, 20480] -> [10240, 320]) BF16 and FP8
     w_orig = torch.randint(0, 30000, (10240, 320), dtype=torch.int16, device="cuda").view(torch.bfloat16)
     w_tiled = w_orig.view(8, 10, 128, 20, 2, 8).permute(0, 3, 1, 2, 4, 5).contiguous().view(160, 20480)
     sess_ut = make_session(lib, "qwen.fused_gemm", "UntileHcBf16", [("w", BF, [160, 20480])], [("o", BF, [10240, 320])], kind=0)
     out_ut = run(sess_ut, {"w": w_tiled}, {"o": (torch.bfloat16, [10240, 320])})["o"]
     assert torch.equal(out_ut.view(torch.int16), w_orig.view(torch.int16)), "UntileHcBf16 kind=0 mismatch"
 
+    wd_f = (torch.randn(10240, 320, generator=gen, device="cuda") * 0.03).bfloat16()
+    wd_sc = (wd_f.float().abs().amax(dim=0).clamp(min=1e-8) / 448.0).to(torch.float32)
+    wd_q = (wd_f.float() / wd_sc[None, :]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    wd_deq = (wd_q.float() * wd_sc[None, :]).bfloat16()
+    wd_q_tiled = wd_q.view(torch.uint8).view(8, 10, 128, 20, 2, 8).permute(0, 3, 1, 2, 4, 5).contiguous().view(160, 20480)
+    sess_ut_fp8 = make_session(lib, "qwen.fused_gemm", "UntileHcBf16", [("w", FP8, [160, 20480])], [("o", BF, [10240, 320])],
+                               kind=0, w_scale=wd_sc.cpu().numpy().tolist())
+    b3 = sess_ut_fp8.io_binding()
+    b3.bind_input("w", "cuda", 0, ORT_ELEM[FP8], [160, 20480], wd_q_tiled.data_ptr())
+    out_ut_fp8 = torch.empty((10240, 320), dtype=torch.bfloat16, device="cuda")
+    b3.bind_output("o", "cuda", 0, ORT_ELEM[BF], [10240, 320], out_ut_fp8.data_ptr())
+    sess_ut_fp8.run_with_iobinding(b3)
+    assert torch.equal(out_ut_fp8, wd_deq), "UntileHcBf16 FP8 kind=0 mismatch"
+
+
+def test_hc_post_block_fp8(lib):
+    gen = torch.Generator(device="cuda").manual_seed(8)
+    wd_orig = (torch.randn(10240, 320, generator=gen, device="cuda") * 0.03).bfloat16()
+    wu_orig = (torch.randn(320, 10240, generator=gen, device="cuda") * 0.03).bfloat16()
+    wd_sc = (2.0 ** torch.floor(torch.log2(wd_orig.float().abs().amax(dim=0).clamp(min=1e-8) / 240.0))).to(torch.float32)
+    wu_sc = (2.0 ** torch.floor(torch.log2(wu_orig.float().abs().amax(dim=0).clamp(min=1e-8) / 240.0))).to(torch.float32)
+    wd_q = (wd_orig.float() / wd_sc[None, :]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    wu_q = (wu_orig.float() / wu_sc[None, :]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    wd_deq_t = (wd_q.float() * wd_sc[None, :]).bfloat16().view(8, 10, 128, 20, 2, 8).permute(0, 3, 1, 2, 4, 5).contiguous().view(160, 20480)
+    wu_deq_t = (wu_q.float() * wu_sc[None, :]).bfloat16().view(10, 32, 4, 160, 2, 8).permute(3, 0, 1, 2, 4, 5).contiguous().view(160, 20480)
+    wd_fp8_t = wd_q.view(torch.uint8).view(8, 10, 128, 20, 2, 8).permute(0, 3, 1, 2, 4, 5).contiguous().view(160, 20480)
+    wu_fp8_t = wu_q.view(torch.uint8).view(10, 32, 4, 160, 2, 8).permute(3, 0, 1, 2, 4, 5).contiguous().view(160, 20480)
+
+    streams = (torch.randn(1, 2, 10240, generator=gen, device="cuda") * 0.2).bfloat16()
+    branch = (torch.randn(1, 2, 2560, generator=gen, device="cuda") * 0.2).bfloat16()
+    gate = (torch.randn(1, 2, 4, generator=gen, device="cuda") * 0.2).bfloat16()
+    norm_w = (torch.ones(10240, device="cuda") + torch.randn(10240, generator=gen, device="cuda") * 0.05).bfloat16()
+    w_inject = (torch.randn(10240, 4, generator=gen, device="cuda") * 0.03).bfloat16()
+    attrs = dict(epsilon=1e-6, silu_alpha=1.0, reduction_scale=0.25, gate_div=4.0, gate_mul=2.0)
+
+    sess_bf = make_session(lib, "qwen.fused_hc", "HcPostBlock",
+                           [("s", BF, [1, 2, 10240]), ("br", BF, [1, 2, 2560]), ("g", BF, [1, 2, 4]),
+                            ("nw", BF, [10240]), ("wd", BF, [160, 20480]), ("wi", BF, [10240, 4]), ("wu", BF, [160, 20480])],
+                           [("so", BF, [1, 2, 10240]), ("pre", BF, [1, 2, 2560]), ("go", BF, [1, 2, 4]), ("scr", F32, [2, 2992])],
+                           **attrs)
+    sess_fp8 = make_session(lib, "qwen.fused_hc", "HcPostBlock",
+                            [("s", BF, [1, 2, 10240]), ("br", BF, [1, 2, 2560]), ("g", BF, [1, 2, 4]),
+                             ("nw", BF, [10240]), ("wd", FP8, [160, 20480]), ("wi", BF, [10240, 4]), ("wu", FP8, [160, 20480])],
+                            [("so", BF, [1, 2, 10240]), ("pre", BF, [1, 2, 2560]), ("go", BF, [1, 2, 4]), ("scr", F32, [2, 2992])],
+                            wd_scale=wd_sc.cpu().numpy().tolist(), wu_scale=wu_sc.cpu().numpy().tolist(), **attrs)
+    out_bf = run(sess_bf, {"s": streams, "br": branch, "g": gate, "nw": norm_w, "wd": wd_deq_t, "wi": w_inject, "wu": wu_deq_t},
+                 {"so": (torch.bfloat16, [1, 2, 10240]), "pre": (torch.bfloat16, [1, 2, 2560]),
+                  "go": (torch.bfloat16, [1, 2, 4]), "scr": (torch.float32, [2, 2992])})
+    out_fp8 = run(sess_fp8, {"s": streams, "br": branch, "g": gate, "nw": norm_w,
+                             "wd": wd_fp8_t.view(torch.float8_e4m3fn), "wi": w_inject, "wu": wu_fp8_t.view(torch.float8_e4m3fn)},
+                  {"so": (torch.bfloat16, [1, 2, 10240]), "pre": (torch.bfloat16, [1, 2, 2560]),
+                   "go": (torch.bfloat16, [1, 2, 4]), "scr": (torch.float32, [2, 2992])})
+    assert torch.equal(out_bf["so"], out_fp8["so"]) and torch.equal(out_bf["pre"], out_fp8["pre"]) and torch.equal(out_bf["go"], out_fp8["go"])
+
 
 OP_TESTS = [
     ("qwen_fused_attn_r5", test_sigmoid_gate_mul),
     ("qwen_fused_ops", test_swish_mul),
+    ("qwen_fused_hc_r5", test_hc_post_block_fp8),
     ("qwen_fused_gemm_r5", test_argmax_rows),
     ("qwen_fused_gemm_r5", test_skinny_gemm_and_dequant_and_untile),
     ("qwen_mtp_head", test_bf16_argmax),

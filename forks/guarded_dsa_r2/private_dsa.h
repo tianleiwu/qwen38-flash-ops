@@ -60,6 +60,7 @@ struct DynamicSparseAttentionData {
   uint8_t* present_value_q = nullptr;
   const float* k_scale = nullptr;
   const float* v_scale = nullptr;
+  int32_t* composite_error = nullptr;
 };
 
 size_t GetDynamicSparseAttentionValidationWorkspaceSize(
@@ -82,7 +83,8 @@ Status ValidateDynamicSparseAttentionOnDevice(
     uint32_t* validation_bitmap,
     size_t max_shared_memory_per_block,
     bool copy_result_to_host,
-    bool per_row_errors = false);
+    bool per_row_errors = false,
+    const int32_t* committed = nullptr);
 
 template <typename T>
 Status LaunchDynamicSparseAttention(

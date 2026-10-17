@@ -18,6 +18,7 @@
 
 #include <cub/block/block_reduce.cuh>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
@@ -28,6 +29,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -92,6 +94,25 @@ __device__ __forceinline__ void Unpack(const uint4& u, float (&f)[8]) {
     f[2 * i] = __uint_as_float(w[i] << 16);
     f[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
   }
+}
+
+__device__ __forceinline__ void UnpackFp8(const uint2& u, float (&f)[8]) {
+  const __half2_raw h0 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u.x & 0xffffu), __NV_E4M3);
+  const __half2_raw h1 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u.x >> 16), __NV_E4M3);
+  const __half2_raw h2 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u.y & 0xffffu), __NV_E4M3);
+  const __half2_raw h3 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(u.y >> 16), __NV_E4M3);
+  const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&h0));
+  const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&h1));
+  const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&h2));
+  const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&h3));
+  f[0] = f0.x;
+  f[1] = f0.y;
+  f[2] = f1.x;
+  f[3] = f1.y;
+  f[4] = f2.x;
+  f[5] = f2.y;
+  f[6] = f3.x;
+  f[7] = f3.y;
 }
 
 // Data-carrying handoff of the merged kernel: a 64-bit slot = (fp32 value, 32-bit launch tag), single-copy atomic, so a consumer that sees
@@ -205,9 +226,9 @@ __device__ __forceinline__ unsigned long long Gt() {
 // CTA (j, s, z) handles K rows [s*1280, s*1280+1280) of the normalised stream; j < 20 owns down
 // columns [j*16, j*16+16), j == 20 owns the four inject columns. The cluster reduces the K splits
 // through DSMEM in a fixed order and rank q finalises columns 2q, 2q+1 (down) or q (inject).
-template <int NR>
+template <int NR, bool kFp8 = false>
 struct DnSm {
-  __align__(16) uint4 wsm[10][kThreads];            // down weights (inject CTAs reuse it as uint2[5][256])
+  __align__(16) std::conditional_t<kFp8, uint2, uint4> wsm[10][kThreads];  // down weights (inject CTAs reuse it as uint2[5][256])
   __align__(16) unsigned short nws[kSliceK];        // norm weight slice (applied on the fly in the GEMV)
   float red2[NR][8][kColSlice];                     // GEMV reduction scratch (NR == 1: 4 columns of the inject CTAs use the first slots)
   unsigned short xs[NR][kSliceK];                   // BF16 bit patterns (the normalised stream is BF16)
@@ -218,9 +239,9 @@ struct DnSm {
   unsigned tag;                                     // merged kernel: launch tag of the data-carrying handoff
 };
 
-template <int NR>
+template <int NR, bool kFp8 = false>
 struct UpSm {
-  __align__(16) uint4 wsm[10][kThreads];
+  __align__(16) std::conditional_t<kFp8, uint2, uint4> wsm[10][kThreads];
   float sf[NR][kDown];
   float red[NR][8][kBranches * kUpSlice];
   float sg[NR][kBranches * kUpSlice];
@@ -229,19 +250,20 @@ struct UpSm {
 };
 
 // start of the up phase that does not depend on the previous op: weight tile + norm slice into shared memory
-template <int NR, bool kTiled>
-__device__ __forceinline__ void UpPrefetch(UpSm<NR>& sm, int hb, const bf16* norm_w, const bf16* w_up) {
+template <int NR, bool kTiled, bool kFp8 = false>
+__device__ __forceinline__ void UpPrefetch(UpSm<NR, kFp8>& sm, int hb, const bf16* norm_w, const void* w_up) {
   const int tid = threadIdx.x;
   const int h0 = hb * kUpSlice;
-  if constexpr (kTiled) {  // w_up tile hb ([160][10 * 256 * 8] bf16) is the shared-memory image of this CTA
+  if constexpr (kTiled) {  // w_up tile hb ([160][10 * 256 * 8] bf16 or fp8) is the shared-memory image of this CTA
     if (tid == 0) {
+      constexpr unsigned kTxBytes = kFp8 ? (10 * kThreads * 8) : (10 * kThreads * 16);
       MbarInit(&sm.mb_w, 1);
-      MbarExpectTx(&sm.mb_w, 10 * kThreads * 16);
-      BulkLoad(&sm.wsm[0][0], w_up + static_cast<int64_t>(hb) * (10 * kThreads * 8), 10 * kThreads * 16, &sm.mb_w);
+      MbarExpectTx(&sm.mb_w, kTxBytes);
+      BulkLoad(&sm.wsm[0][0], static_cast<const uint8_t*>(w_up) + static_cast<int64_t>(hb) * kTxBytes, kTxBytes, &sm.mb_w);
     }
   } else {
     const int g = tid & 7, c = g >> 1, half = g & 1, rp = tid >> 3;
-    const bf16* wu_base = w_up + static_cast<int64_t>(c) * kHidden + h0 + half * 8;
+    const bf16* wu_base = static_cast<const bf16*>(w_up) + static_cast<int64_t>(c) * kHidden + h0 + half * 8;
 #pragma unroll
     for (int i = 0; i < 10; ++i) CpAsync16(&sm.wsm[i][tid], wu_base + static_cast<int64_t>(rp + 32 * i) * kStreamDim);
     CpCommit();
@@ -256,13 +278,14 @@ __device__ __forceinline__ void UpPrefetch(UpSm<NR>& sm, int hb, const bf16* nor
 // columns [j*16, j*16+16), j == 20 owns the four inject columns. The K splits are written as raw
 // partial sums to the scratch row; the up phase reduces them in a fixed order (s = 0..7).
 // kMerged: the CTA also prefetches its up-phase weights (UpSm *up_sm, tile up_hb < kUpBlocks).
-template <bool kPost, int NR, bool kTiled, bool kMerged>
-__device__ __forceinline__ void DnPhase(DnSm<NR>& sm, const bf16* __restrict__ streams, const bf16* __restrict__ branch,
+template <bool kPost, int NR, bool kTiled, bool kMerged, bool kFp8 = false>
+__device__ __forceinline__ void DnPhase(DnSm<NR, kFp8>& sm, const bf16* __restrict__ streams, const bf16* __restrict__ branch,
                                         const bf16* __restrict__ gate, const bf16* __restrict__ norm_w,
-                                        const bf16* __restrict__ w_down, const bf16* __restrict__ w_inject,
+                                        const void* __restrict__ w_down, const bf16* __restrict__ w_inject,
                                         bf16* __restrict__ streams_out, float* __restrict__ scratch, float epsilon,
-                                        float silu_alpha, int trigger_at, UpSm<NR>* up_sm, int up_hb, const bf16* w_up,
-                                        unsigned long long* tab, const unsigned long long* ctr) {
+                                        float silu_alpha, int trigger_at, UpSm<NR, kFp8>* up_sm, int up_hb, const void* w_up,
+                                        unsigned long long* tab, const unsigned long long* ctr,
+                                        const float* __restrict__ wd_scale = nullptr) {
   const bool early_w = (trigger_at & 16) != 0;
   unsigned long long c0 = 0;
   if (kMerged && threadIdx.x == 0) c0 = LdSlot(ctr);  // sampled up front; consumed once the stream loads have returned
@@ -286,7 +309,7 @@ __device__ __forceinline__ void DnPhase(DnSm<NR>& sm, const bf16* __restrict__ s
   uint64_t& mb_w = sm.mb_w;
   uint64_t& mb_n = sm.mb_n;
 
-  // kTiled: w_down is [8 * 20 tiles][10 * 256 * 8] bf16, tile (s * 20 + j) is the shared-memory image of CTA (j, s); the bulk copy engine
+  // kTiled: w_down is [8 * 20 tiles][10 * 256 * 8] bf16 or fp8, tile (s * 20 + j) is the shared-memory image of CTA (j, s); the bulk copy engine
   // streams it (and the norm slice) without occupying the load/store pipe. w_inject is already contiguous per split.
   if constexpr (kTiled) {
     if (tid == 0) {
@@ -299,15 +322,16 @@ __device__ __forceinline__ void DnPhase(DnSm<NR>& sm, const bf16* __restrict__ s
         MbarExpectTx(&mb_n, kSliceK * 2);
         BulkLoad(nws, norm_w + c * kHidden + h0, kSliceK * 2, &mb_n);
         if (j < kColSlices) {
-          MbarExpectTx(&mb_w, 10 * kThreads * 16);
-          BulkLoad(&wsm[0][0], w_down + static_cast<int64_t>(s * kColSlices + j) * (10 * kThreads * 8), 10 * kThreads * 16, &mb_w);
+          constexpr unsigned kTxBytes = kFp8 ? (10 * kThreads * 8) : (10 * kThreads * 16);
+          MbarExpectTx(&mb_w, kTxBytes);
+          BulkLoad(&wsm[0][0], static_cast<const uint8_t*>(w_down) + static_cast<int64_t>(s * kColSlices + j) * kTxBytes, kTxBytes, &mb_w);
         } else {
           MbarExpectTx(&mb_w, 5 * kThreads * 8);
           BulkLoad(&wsm[0][0], w_inject + static_cast<int64_t>(s * kSliceK) * kGate, 5 * kThreads * 8, &mb_w);
         }
       }
       if constexpr (kMerged) {
-        if (up_hb < kUpBlocks) UpPrefetch<NR, true>(*up_sm, up_hb, norm_w, w_up);
+        if (up_hb < kUpBlocks) UpPrefetch<NR, true, kFp8>(*up_sm, up_hb, norm_w, w_up);
       }
     }
   }
@@ -341,8 +365,9 @@ __device__ __forceinline__ void DnPhase(DnSm<NR>& sm, const bf16* __restrict__ s
         MbarExpectTx(&mb_n, kSliceK * 2);
         BulkLoad(nws, norm_w + c * kHidden + h0, kSliceK * 2, &mb_n);
         if (j < kColSlices) {
-          MbarExpectTx(&mb_w, 10 * kThreads * 16);
-          BulkLoad(&wsm[0][0], w_down + static_cast<int64_t>(s * kColSlices + j) * (10 * kThreads * 8), 10 * kThreads * 16, &mb_w);
+          constexpr unsigned kTxBytes = kFp8 ? (10 * kThreads * 8) : (10 * kThreads * 16);
+          MbarExpectTx(&mb_w, kTxBytes);
+          BulkLoad(&wsm[0][0], static_cast<const uint8_t*>(w_down) + static_cast<int64_t>(s * kColSlices + j) * kTxBytes, kTxBytes, &mb_w);
         } else {
           MbarExpectTx(&mb_w, 5 * kThreads * 8);
           BulkLoad(&wsm[0][0], w_inject + static_cast<int64_t>(s * kSliceK) * kGate, 5 * kThreads * 8, &mb_w);
@@ -353,7 +378,7 @@ __device__ __forceinline__ void DnPhase(DnSm<NR>& sm, const bf16* __restrict__ s
   if (tid < kSliceK / 8) CpAsync16(&nws[tid * 8], norm_w + c * kHidden + h0 + tid * 8);
   CpCommit();
   if (j < kColSlices) {
-    const bf16* wd_base = w_down + static_cast<int64_t>(s * kSliceK) * kDown + j * kColSlice + cg * 8;
+    const bf16* wd_base = static_cast<const bf16*>(w_down) + static_cast<int64_t>(s * kSliceK) * kDown + j * kColSlice + cg * 8;
 #pragma unroll
     for (int i = 0; i < 10; ++i) CpAsync16(&wsm[i][tid], wd_base + static_cast<int64_t>(rp + 128 * i) * kDown);
   } else {
@@ -439,7 +464,7 @@ __device__ __forceinline__ void DnPhase(DnSm<NR>& sm, const bf16* __restrict__ s
   if constexpr (kTiled) MbarWait(&mb_w); else CpWait<0>();
   if constexpr (kMerged) {
     // up-phase weights: queued behind the down weights (not competing with them); already issued when the weights were early
-    if (!early_w && up_hb < kUpBlocks) UpPrefetch<NR, true>(*up_sm, up_hb, norm_w, w_up);
+    if (!early_w && up_hb < kUpBlocks) UpPrefetch<NR, true, kFp8>(*up_sm, up_hb, norm_w, w_up);
   }
   if (trigger_at == 1) GridTrigger();
   TRACE(0, 4, blk);
@@ -454,7 +479,8 @@ __device__ __forceinline__ void DnPhase(DnSm<NR>& sm, const bf16* __restrict__ s
 #pragma unroll
     for (int i = 0; i < 10; ++i) {
       float wf[8];
-      Unpack(wsm[i][tid], wf);
+      if constexpr (kFp8) UnpackFp8(wsm[i][tid], wf);
+      else Unpack(wsm[i][tid], wf);
 #pragma unroll
       for (int q = 0; q < NR; ++q) {
         const float xv = xn(q, rp + 128 * i);
@@ -478,6 +504,9 @@ __device__ __forceinline__ void DnPhase(DnSm<NR>& sm, const bf16* __restrict__ s
       float v = 0.0f;
 #pragma unroll
       for (int w = 0; w < 8; ++w) v += red2[q][w][col];
+      if constexpr (kFp8) {
+        if (wd_scale != nullptr) v *= wd_scale[j * kColSlice + col];
+      }
       if constexpr (kMerged) StoreTagged(tab + (r0 + q) * kTabRow + s * (kDown + 8) + j * kColSlice + col, v, sm.tag);
       else scratch[(r0 + q) * kScratchStride + kPartOff + s * kPartStride + j * kColSlice + col] = v;
     }
@@ -538,20 +567,21 @@ __global__ void __launch_bounds__(kThreads)
                  bf16* __restrict__ streams_out, float* __restrict__ scratch, float epsilon, float silu_alpha, int trigger_at) {
   extern __shared__ __align__(128) unsigned char smem_raw[];  // dynamic: DnSm<2> exceeds the 48 KB static limit
   DnSm<NR>& sm = *reinterpret_cast<DnSm<NR>*>(smem_raw);
-  DnPhase<kPost, NR, kTiled, false>(sm, streams, branch, gate, norm_w, w_down, w_inject, streams_out, scratch, epsilon, silu_alpha,
-                                    trigger_at, nullptr, 0, nullptr, nullptr, nullptr);
+  DnPhase<kPost, NR, kTiled, false, false>(sm, streams, branch, gate, norm_w, w_down, w_inject, streams_out, scratch, epsilon, silu_alpha,
+                                           trigger_at, nullptr, 0, nullptr, nullptr, nullptr);
 }
 
 // grid: (kUpBlocks, 1, rows / NR). Block hb owns h in [hb*16, hb*16+16) of every branch; NR rows share the weight stream.
 // UpBody runs after the dependency on the down phase resolved (grid wait or software barrier).
 // kTagged (merged kernel): the K-split partials / inv_rms are polled from the data-carrying table `tab` instead of read from scratch,
 // and the post-mixed stream values are recomputed from the op inputs (branch / gate when kPost) instead of read from streams_out.
-template <int NR, bool kTiled, bool kTagged = false, bool kPost = false>
-__device__ __forceinline__ void UpBody(UpSm<NR>& sm, int hb, const bf16* __restrict__ streams, float* __restrict__ scratch,
+template <int NR, bool kTiled, bool kTagged = false, bool kPost = false, bool kFp8 = false>
+__device__ __forceinline__ void UpBody(UpSm<NR, kFp8>& sm, int hb, const bf16* __restrict__ streams, float* __restrict__ scratch,
                                        bf16* __restrict__ pre, bf16* __restrict__ gate_out, float reduction_scale,
                                        float gate_div, float gate_mul, int final_out, const unsigned long long* tab = nullptr,
                                        unsigned tag = 0, float silu_alpha = 0.0f, const bf16* __restrict__ branch = nullptr,
-                                       const bf16* __restrict__ gate_in = nullptr) {
+                                       const bf16* __restrict__ gate_in = nullptr,
+                                       const float* __restrict__ wu_scale = nullptr) {
   const int64_t r0 = static_cast<int64_t>(blockIdx.z) * NR;
   const int tid = threadIdx.x;
   const int h0 = hb * kUpSlice;
@@ -733,7 +763,8 @@ __device__ __forceinline__ void UpBody(UpSm<NR>& sm, int hb, const bf16* __restr
 #pragma unroll
   for (int i = 0; i < 10; ++i) {
     float wf[8];
-    Unpack(wsm[i][tid], wf);
+    if constexpr (kFp8) UnpackFp8(wsm[i][tid], wf);
+    else Unpack(wsm[i][tid], wf);
 #pragma unroll
     for (int q = 0; q < NR; ++q) {
       const float sv = sf[q][rp + 32 * i];
@@ -777,6 +808,9 @@ __device__ __forceinline__ void UpBody(UpSm<NR>& sm, int hb, const bf16* __restr
     float v = 0.0f;
 #pragma unroll
     for (int t = 0; t < 8; ++t) v += red[q][t][col];
+    if constexpr (kFp8) {
+      if (wu_scale != nullptr) v *= wu_scale[(col >> 4) * kHidden + hb * kUpSlice + (col & 15)];
+    }
     sg[q][col] = SigmoidBf16(R(v));
   }
   __syncthreads();
@@ -819,33 +853,34 @@ __global__ void __launch_bounds__(kThreads)
 // dependency on the previous op resolves when HC_EARLYW is set), the down phase writes the K-split partials, a software grid barrier
 // (monotonic arrival counter, 168 arrivals per launch) replaces the second kernel boundary, and CTAs 0..159 then run the up phase.
 // All 168 CTAs must be co-resident (checked on the host); never launched with gridDim.z > 1.
-template <int NR>
-__host__ __device__ constexpr size_t BlockSmemUpOff() { return (sizeof(DnSm<NR>) + 127) / 128 * 128; }
-template <int NR>
-__host__ __device__ constexpr size_t BlockSmemBytes() { return BlockSmemUpOff<NR>() + sizeof(UpSm<NR>); }
+template <int NR, bool kFp8 = false>
+__host__ __device__ constexpr size_t BlockSmemUpOff() { return (sizeof(DnSm<NR, kFp8>) + 127) / 128 * 128; }
+template <int NR, bool kFp8 = false>
+__host__ __device__ constexpr size_t BlockSmemBytes() { return BlockSmemUpOff<NR, kFp8>() + sizeof(UpSm<NR, kFp8>); }
 
-template <bool kPost, int NR>
-__global__ void __launch_bounds__(kThreads)
+template <bool kPost, int NR, bool kFp8 = false>
+__global__ void __launch_bounds__(kThreads, 2)
     HcBlockKernel(const bf16* __restrict__ streams, const bf16* __restrict__ branch, const bf16* __restrict__ gate,
-                  const bf16* __restrict__ norm_w, const bf16* __restrict__ w_down, const bf16* __restrict__ w_inject,
-                  const bf16* __restrict__ w_up, bf16* __restrict__ streams_out, float* __restrict__ scratch,
+                  const bf16* __restrict__ norm_w, const void* __restrict__ w_down, const bf16* __restrict__ w_inject,
+                  const void* __restrict__ w_up, bf16* __restrict__ streams_out, float* __restrict__ scratch,
                   bf16* __restrict__ pre, bf16* __restrict__ gate_out, float epsilon, float silu_alpha, float reduction_scale,
                   float gate_div, float gate_mul, unsigned long long* __restrict__ tab, unsigned long long* __restrict__ ctr,
-                  int trigger_at, int final_out) {
+                  int trigger_at, int final_out, const float* __restrict__ wd_scale = nullptr,
+                  const float* __restrict__ wu_scale = nullptr) {
   extern __shared__ __align__(128) unsigned char smem_raw[];
-  DnSm<NR>& sd = *reinterpret_cast<DnSm<NR>*>(smem_raw);
-  UpSm<NR>& su = *reinterpret_cast<UpSm<NR>*>(smem_raw + BlockSmemUpOff<NR>());
+  DnSm<NR, kFp8>& sd = *reinterpret_cast<DnSm<NR, kFp8>*>(smem_raw);
+  UpSm<NR, kFp8>& su = *reinterpret_cast<UpSm<NR, kFp8>*>(smem_raw + BlockSmemUpOff<NR, kFp8>());
   const int tid = threadIdx.x;
   const int b = blockIdx.y * kDownGridX + blockIdx.x;  // CTAs b < kUpBlocks also own up tile b
-  DnPhase<kPost, NR, true, true>(sd, streams, branch, gate, norm_w, w_down, w_inject, streams_out, scratch, epsilon, silu_alpha,
-                                 trigger_at, &su, b, w_up, tab, ctr);
+  DnPhase<kPost, NR, true, true, kFp8>(sd, streams, branch, gate, norm_w, w_down, w_inject, streams_out, scratch, epsilon, silu_alpha,
+                                       trigger_at, &su, b, w_up, tab, ctr, wd_scale);
   TRACE(1, 0, b);
   TRACE(1, 1, b);
   CLK(1, 0, b);
   CLK(1, 1, b);
   if (b < kUpBlocks) {
-    UpBody<NR, true, true, kPost>(su, b, streams, scratch, pre, gate_out, reduction_scale, gate_div, gate_mul, final_out, tab, sd.tag,
-                                  silu_alpha, branch, gate);
+    UpBody<NR, true, true, kPost, kFp8>(su, b, streams, scratch, pre, gate_out, reduction_scale, gate_div, gate_mul, final_out, tab, sd.tag,
+                                        silu_alpha, branch, gate, wu_scale);
   }
   __syncthreads();
   if (tid == 0) asm volatile("red.relaxed.gpu.global.add.u64 [%0], 1;" ::"l"(ctr) : "memory");  // launch counter, see StoreTagged
@@ -1120,6 +1155,8 @@ struct HcBlockState {
   float epsilon, silu_alpha, reduction_scale, gate_div, gate_mul;
   unsigned long long* tab = nullptr;  // data-carrying handoff table (2 rows) + launch counter, owned by this node
   unsigned long long* ctr = nullptr;
+  float* d_wd_scale = nullptr;
+  float* d_wu_scale = nullptr;
   int merged_ok = -1;  // -1 unknown, 0 no, 1 yes
 
   HcBlockState(const OrtApi& a, const OrtKernelInfo* info) : api(a) {
@@ -1129,21 +1166,50 @@ struct HcBlockState {
     reduction_scale = k.GetAttribute<float>("reduction_scale");
     gate_div = k.GetAttribute<float>("gate_div");
     gate_mul = k.GetAttribute<float>("gate_mul");
+    std::vector<float> wd_host, wu_host;
+    try {
+      wd_host = k.GetAttributes<float>("wd_scale");
+    } catch (const std::exception&) {
+    }
+    try {
+      wu_host = k.GetAttributes<float>("wu_scale");
+    } catch (const std::exception&) {
+    }
+    if (!wd_host.empty()) {
+      if (cudaMalloc(&d_wd_scale, wd_host.size() * sizeof(float)) != cudaSuccess ||
+          cudaMemcpy(d_wd_scale, wd_host.data(), wd_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(d_wd_scale);
+        d_wd_scale = nullptr;
+        throw std::runtime_error("HcBlock: failed to upload wd_scale");
+      }
+    }
+    if (!wu_host.empty()) {
+      if (cudaMalloc(&d_wu_scale, wu_host.size() * sizeof(float)) != cudaSuccess ||
+          cudaMemcpy(d_wu_scale, wu_host.data(), wu_host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(d_wd_scale);
+        cudaFree(d_wu_scale);
+        d_wd_scale = nullptr;
+        d_wu_scale = nullptr;
+        throw std::runtime_error("HcBlock: failed to upload wu_scale");
+      }
+    }
   }
   ~HcBlockState() {
     if (tab != nullptr) cudaFree(tab);
+    if (d_wd_scale != nullptr) cudaFree(d_wd_scale);
+    if (d_wu_scale != nullptr) cudaFree(d_wu_scale);
   }
 
-  template <int NR>
+  template <int NR, bool kFp8 = false>
   bool CheckResident() {
-    auto kernel = HcBlockKernel<kPost, NR>;
-    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(BlockSmemBytes<NR>())) != cudaSuccess) {
+    auto kernel = HcBlockKernel<kPost, NR, kFp8>;
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(BlockSmemBytes<NR, kFp8>())) != cudaSuccess) {
       cudaGetLastError();
       return false;
     }
     int per_sm = 0, sms = 0, dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, kThreads, BlockSmemBytes<NR>()) != cudaSuccess) {
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, kThreads, BlockSmemBytes<NR, kFp8>()) != cudaSuccess) {
       cudaGetLastError();
       return false;
     }
@@ -1151,7 +1217,7 @@ struct HcBlockState {
   }
 
   // Allocation and the co-residency check happen on the first (never capturing) call.
-  bool EnsureMerged(cudaStream_t stream) {
+  bool EnsureMerged(cudaStream_t stream, bool fp8) {
     if (merged_ok >= 0) return merged_ok == 1;
     merged_ok = 0;
     if (!MergeEnabled()) return false;
@@ -1159,7 +1225,9 @@ struct HcBlockState {
     if (cudaStreamIsCapturing(stream, &status) != cudaSuccess || status != cudaStreamCaptureStatusNone) {
       throw std::runtime_error("HcBlock: first execution must not happen during CUDA graph capture");
     }
-    if (!CheckResident<1>() || !CheckResident<2>()) return false;
+    const bool ok = fp8 ? (CheckResident<1, true>() && CheckResident<2, true>())
+                        : (CheckResident<1, false>() && CheckResident<2, false>());
+    if (!ok) return false;
     const size_t bytes = (2 * static_cast<size_t>(kTabRow) + 8) * sizeof(unsigned long long);
     if (cudaMalloc(&tab, bytes) != cudaSuccess) return false;
     if (cudaMemset(tab, 0, bytes) != cudaSuccess) return false;
@@ -1178,6 +1246,10 @@ struct HcBlockState {
       const bool tiled_d = IsTiled(c.GetInput(o + 1), {kStreamDim, kDown}, "w_down");
       CheckDims(c.GetInput(o + 2), {kStreamDim, kGate}, "w_inject");
       const bool tiled_u = IsTiled(c.GetInput(o + 3), {kDown, kStreamDim}, "w_up");
+      const auto dtype_d = c.GetInput(o + 1).GetTensorTypeAndShapeInfo().GetElementType();
+      const auto dtype_u = c.GetInput(o + 3).GetTensorTypeAndShapeInfo().GetElementType();
+      const bool fp8 = (dtype_d == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN &&
+                        dtype_u == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN);
       bf16* streams_out = nullptr;
       size_t next = 0;
       if (kPost) {
@@ -1192,17 +1264,32 @@ struct HcBlockState {
       float* scratch_ptr = scratch.GetTensorMutableData<float>();
       const bf16* br = kPost ? In(c, 1) : nullptr;
       const bf16* gt = kPost ? In(c, 2) : nullptr;
-      if (tiled_d && tiled_u && (rows == 1 || rows == 2) && EnsureMerged(stream)) {
-        if (rows == 2) {
-          LaunchSmem(HcBlockKernel<kPost, 2>, dim3(kDownGridX, kSplit, 1), BlockSmemBytes<2>(), stream, In(c, 0), br, gt, In(c, o),
-                     In(c, o + 1), In(c, o + 2), In(c, o + 3), streams_out, scratch_ptr, Out(pre), Out(gate), epsilon, silu_alpha,
-                     reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut());
+      const void* wd_ptr = c.GetInput(o + 1).GetTensorRawData();
+      const void* wu_ptr = c.GetInput(o + 3).GetTensorRawData();
+      if (tiled_d && tiled_u && (rows == 1 || rows == 2) && EnsureMerged(stream, fp8)) {
+        if (fp8) {
+          if (rows == 2) {
+            LaunchSmem(HcBlockKernel<kPost, 2, true>, dim3(kDownGridX, kSplit, 1), BlockSmemBytes<2, true>(), stream, In(c, 0), br, gt,
+                       In(c, o), wd_ptr, In(c, o + 2), wu_ptr, streams_out, scratch_ptr, Out(pre), Out(gate), epsilon, silu_alpha,
+                       reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut(), d_wd_scale, d_wu_scale);
+          } else {
+            LaunchSmem(HcBlockKernel<kPost, 1, true>, dim3(kDownGridX, kSplit, 1), BlockSmemBytes<1, true>(), stream, In(c, 0), br, gt,
+                       In(c, o), wd_ptr, In(c, o + 2), wu_ptr, streams_out, scratch_ptr, Out(pre), Out(gate), epsilon, silu_alpha,
+                       reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut(), d_wd_scale, d_wu_scale);
+          }
         } else {
-          LaunchSmem(HcBlockKernel<kPost, 1>, dim3(kDownGridX, kSplit, 1), BlockSmemBytes<1>(), stream, In(c, 0), br, gt, In(c, o),
-                     In(c, o + 1), In(c, o + 2), In(c, o + 3), streams_out, scratch_ptr, Out(pre), Out(gate), epsilon, silu_alpha,
-                     reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut());
+          if (rows == 2) {
+            LaunchSmem(HcBlockKernel<kPost, 2, false>, dim3(kDownGridX, kSplit, 1), BlockSmemBytes<2, false>(), stream, In(c, 0), br, gt,
+                       In(c, o), wd_ptr, In(c, o + 2), wu_ptr, streams_out, scratch_ptr, Out(pre), Out(gate), epsilon, silu_alpha,
+                       reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut(), nullptr, nullptr);
+          } else {
+            LaunchSmem(HcBlockKernel<kPost, 1, false>, dim3(kDownGridX, kSplit, 1), BlockSmemBytes<1, false>(), stream, In(c, 0), br, gt,
+                       In(c, o), wd_ptr, In(c, o + 2), wu_ptr, streams_out, scratch_ptr, Out(pre), Out(gate), epsilon, silu_alpha,
+                       reduction_scale, gate_div, gate_mul, tab, ctr, TriggerAt() + EarlyW(), FinalOut(), nullptr, nullptr);
+          }
         }
       } else {
+        if (fp8) throw std::invalid_argument("HcBlock: FP8 weights require tiled merged execution (rows in {1, 2})");
         LaunchDown<kPost, true>(rows, tiled_d, stream, In(c, 0), br, gt, In(c, o), In(c, o + 1), In(c, o + 2), streams_out,
                                 scratch_ptr, epsilon, silu_alpha, 1);
         LaunchUp(rows, tiled_u, stream, kPost ? streams_out : In(c, 0), In(c, o), In(c, o + 3), scratch_ptr, Out(pre), Out(gate),
@@ -1218,6 +1305,7 @@ struct HcBlockState {
 
 constexpr auto kBF = ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
 constexpr auto kF32 = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+constexpr auto kUNDEF = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
 
 template <typename Derived, typename State>
 struct HcOp : Ort::CustomOpBase<Derived, State, true> {
@@ -1247,12 +1335,12 @@ struct HcPostDownOp : HcOp<HcPostDownOp, HcDownState<true>> {
   const char* GetName() const { return "HcPostDown"; }
 };
 struct HcBlockOp : HcOp<HcBlockOp, HcBlockState<false>> {
-  static constexpr std::array<ONNXTensorElementDataType, 5> kIn = {kBF, kBF, kBF, kBF, kBF};
+  static constexpr std::array<ONNXTensorElementDataType, 5> kIn = {kBF, kBF, kUNDEF, kBF, kUNDEF};
   static constexpr std::array<ONNXTensorElementDataType, 3> kOut = {kBF, kBF, kF32};
   const char* GetName() const { return "HcBlock"; }
 };
 struct HcPostBlockOp : HcOp<HcPostBlockOp, HcBlockState<true>> {
-  static constexpr std::array<ONNXTensorElementDataType, 7> kIn = {kBF, kBF, kBF, kBF, kBF, kBF, kBF};
+  static constexpr std::array<ONNXTensorElementDataType, 7> kIn = {kBF, kBF, kBF, kBF, kUNDEF, kBF, kUNDEF};
   static constexpr std::array<ONNXTensorElementDataType, 4> kOut = {kBF, kBF, kBF, kF32};
   const char* GetName() const { return "HcPostBlock"; }
 };
