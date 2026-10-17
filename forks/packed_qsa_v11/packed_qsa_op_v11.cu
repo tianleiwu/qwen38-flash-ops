@@ -216,6 +216,7 @@ struct PackedQsaKernel {
       params.block_topk = token_budget / compress_ratio;
       params.mid_kv_buffer = mid_buffer;
       params.mid_state_lengths = static_cast<int32_t*>(mid_lengths);
+      params.rejected_status_code = total_tokens >= 2 ? 0x99 : 9;
 
       void* raw_stream = nullptr;
       Ort::ThrowOnError(
@@ -263,8 +264,6 @@ struct PackedQsaKernel {
       if (!status.IsOK()) {
         return api.CreateStatus(ORT_FAIL, status.ErrorMessage().c_str());
       }
-      MapValidationStatus<<<1, 1, 0, stream>>>(
-          validation_status.GetTensorMutableData<int32_t>(), total_tokens);
       CheckCuda(cudaGetLastError());
       if (std::getenv("PACKED_QSA_DEBUG_SYNC") != nullptr) {
         CheckCuda(cudaStreamSynchronize(stream));

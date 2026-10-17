@@ -1104,6 +1104,14 @@ __global__ void GroupedDecodeDynamicSparseAttentionKernel(
   const int selected_count = max(0, min(selected_counts[b], max_selected));
   const int candidate_count = local_count + selected_count;
   const int candidate_begin = split * kGroupedDecodeCandidatesPerSplit;
+  if (candidate_begin >= candidate_count && !(split == 0 && use_smooth_softmax)) {
+    if (active_head && lane == 0) {
+      const int partial_block = (b * num_heads + head) * split_count + split;
+      partial_max[partial_block] = -FLT_MAX;
+      partial_sum[partial_block] = 0.0f;
+    }
+    return;
+  }
   const int32_t* row_indices =
       max_selected == 0 ? selected_indices : selected_indices + static_cast<int64_t>(b) * max_selected;
 
@@ -1325,13 +1333,15 @@ __global__ void GroupedDecodeDynamicSparseAttentionKernel(
       partial_max[partial_block] = running_max;
       partial_sum[partial_block] = running_sum;
     }
-    const float* vs_head = (kKvQuantMode != 0 && v_scale != nullptr)
-                               ? v_scale + static_cast<int64_t>(kv_head) * head_size
-                               : nullptr;
+    if (running_max != -FLT_MAX) {
+      const float* vs_head = (kKvQuantMode != 0 && v_scale != nullptr)
+                                 ? v_scale + static_cast<int64_t>(kv_head) * head_size
+                                 : nullptr;
 #pragma unroll
-    for (int i = 0; i < kValuesPerLane; ++i) {
-      const float acc = vs_head != nullptr ? accumulator[i] * __ldg(vs_head + lane + i * 32) : accumulator[i];
-      partial_output[static_cast<int64_t>(partial_block) * head_size + lane + i * 32] = acc;
+      for (int i = 0; i < kValuesPerLane; ++i) {
+        const float acc = vs_head != nullptr ? accumulator[i] * __ldg(vs_head + lane + i * 32) : accumulator[i];
+        partial_output[static_cast<int64_t>(partial_block) * head_size + lane + i * 32] = acc;
+      }
     }
   }
 }
@@ -1651,43 +1661,42 @@ __global__ void MergeGroupedDecodeDynamicSparseAttentionKernel(const float* part
   const int h = static_cast<int>(threadIdx.x);
   const int lane = h & 31;
   const int partial_start = query_block * split_count;
-  __shared__ float max_logit;
+  __shared__ float s_scale[32];
   __shared__ float denominator;
+  __shared__ int s_active_splits;
 
   if (h < 32) {
-    float value = lane < split_count ? partial_max[partial_start + lane] : -FLT_MAX;
+    const float smax = lane < split_count ? partial_max[partial_start + lane] : -FLT_MAX;
+    float value = smax;
     for (int offset = 16; offset > 0; offset >>= 1) {
       value = fmaxf(value, __shfl_down_sync(0xffffffff, value, offset));
     }
-    if (lane == 0) {
-      max_logit = value;
-    }
-  }
-  __syncthreads();
-
-  if (h < 32) {
-    float value = 0.0f;
-    if (lane < split_count && partial_max[partial_start + lane] != -FLT_MAX) {
-      value = partial_sum[partial_start + lane] *
-              expf(partial_max[partial_start + lane] - max_logit);
-    }
+    const float max_logit = __shfl_sync(0xffffffff, value, 0);
+    const bool valid = lane < split_count && smax != -FLT_MAX;
+    const float scale = valid ? expf(smax - max_logit) : 0.0f;
+    s_scale[lane] = scale;
+    const unsigned active_mask = __ballot_sync(0xffffffff, valid);
+    float sum_val = valid ? partial_sum[partial_start + lane] * scale : 0.0f;
     for (int offset = 16; offset > 0; offset >>= 1) {
-      value += __shfl_down_sync(0xffffffff, value, offset);
+      sum_val += __shfl_down_sync(0xffffffff, sum_val, offset);
     }
     if (lane == 0) {
-      denominator = value;
+      denominator = sum_val;
+      s_active_splits = active_mask == 0u ? 0 : (32 - __clz(active_mask));
     }
   }
   __syncthreads();
 
   if (h < head_size) {
     float accumulator = 0.0f;
-    for (int split = 0; split < split_count; ++split) {
-      const float split_max = partial_max[partial_start + split];
-      if (split_max != -FLT_MAX) {
+    const int active_splits = s_active_splits;
+#pragma unroll 4
+    for (int split = 0; split < active_splits; ++split) {
+      const float scale = s_scale[split];
+      if (scale != 0.0f) {
         const int64_t partial_offset =
             (static_cast<int64_t>(partial_start + split) * head_size) + h;
-        accumulator += partial_output[partial_offset] * expf(split_max - max_logit);
+        accumulator += __ldg(partial_output + partial_offset) * scale;
       }
     }
     output[static_cast<int64_t>(query_block) * head_size + h] =

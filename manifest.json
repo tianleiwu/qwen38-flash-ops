@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "source_tree_sha256": "ae9aa0f54c30b2752a247c29dc271586b957d9f1e30ffed02f4b992b66d5c59d",
+  "source_tree_sha256": "b6c0f31ec4c867a96824f86de28606310491bf6e69cf9da19f315e0223288ff4",
   "toolchain": {
-    "nvcc": "Cuda compilation tools, release 13.0, V13.0.48",
+    "nvcc": null,
     "cxx": "c++ (GCC) 13.2.0"
   },
   "libraries": {
@@ -14,9 +14,8 @@
         "SharedGateMulAdd"
       ],
       "built": true,
-      "sha256": "50df51ca3d7a7e0801572c55f321648e8eefb63f947046fa2e5bb33b0e74d6cb",
+      "sha256": "2c8e14b80c91d54cc0c78d8b7275df7dc04773ba4f6532afb31205904e46bef8",
       "size": 1057992,
-      "shipped_reference_sha256": "45d8cca6ec31509916baefb999961010707c3936c9a913c9e3641061d18486ac",
       "sources": {
         "src/fused_ops/fused_ops.cu": "4e36ae39576d73fcc66c2694bfce3e12962f856e34a8d10eb5a1f038c759c633"
       }
@@ -33,9 +32,8 @@
         "SigmoidGateMul"
       ],
       "built": true,
-      "sha256": "73d2e5792c043499976209afb9ab766cbbbd35ead981b9ae042b8b3ba73a92ba",
+      "sha256": "daef6c86759c03038a6c4ebc63b641dba69d96bdf4de572af8d0798e769318e0",
       "size": 1201216,
-      "shipped_reference_sha256": "5f5f214c1b460912418fd36e1a436ed9a873def9d8b4cf908026edacc16723b5",
       "sources": {
         "src/fused_attn/fused_attn_r5.cu": "dd4f4c5952d1bac8014f687e59237d9fabd5f9834cadf973bfdf9193b9690d89",
         "src/common/sigmoid_acc.cuh": "84230fd26491115cb4eb996f84f3b461ad5fa525a3b8e7d6aad26730b0ac9309"
@@ -54,11 +52,10 @@
         "HcMixUp"
       ],
       "built": true,
-      "sha256": "0e957747ef0bbb1eddcbd1c20e58d1ec97d5611b10196bc4fe1ce6f177e7ef86",
+      "sha256": "93558a9d5332a7bfbcd6b92f0d9b4432b8093c5417f12e0c24bc08c0f3badb20",
       "size": 2051448,
-      "shipped_reference_sha256": "058dde98daa4bc9afc3bce6f763f965ef45708d1e168275d2bf206b127bf8e27",
       "sources": {
-        "src/fused_hc/fused_hc_r5.cu": "68197b77ab885b2245353ca61624b191fdd0dac2397ead805e918ec1dd73e61e",
+        "src/fused_hc/fused_hc_r5.cu": "aaab4574e2a6be6a3ade649515fea3f7710c05fa693829f9fbc7aa2fd878298e",
         "src/common/sigmoid_acc.cuh": "84230fd26491115cb4eb996f84f3b461ad5fa525a3b8e7d6aad26730b0ac9309"
       }
     },
@@ -72,9 +69,8 @@
         "UntileHcBf16"
       ],
       "built": true,
-      "sha256": "984f5a9f1339e74c26b5c5cfd93f5c76dfecbb4d5b2eb876d8a0102199e5e4ed",
+      "sha256": "60a69b378d21a48a7e233cf7e3a509e3d82bbf6d2a2a2a5af14065d3b7d589d0",
       "size": 5886184,
-      "shipped_reference_sha256": "059d78c4859b8347f174f7865b6a15650378a9c6b74c524ee185ef986ab1979f",
       "sources": {
         "src/fused_gemm/fused_gemm.cu": "db8a8104fd4ea0ec6a0afa8d6eae7e87cb040897f8bc4f6a1be3c1027ad7f94c",
         "src/fused_gemm/skinny_gemm.cuh": "a21f9acf8b924ab51400baccef231f1217e846d4211a6cd8c3a12c128d51b219",
@@ -92,9 +88,8 @@
         "RowSelectBf16x3"
       ],
       "built": true,
-      "sha256": "96ba11519ffd556fe475d93da94655a181a86f27a28b60f81807a2472c479be3",
+      "sha256": "7e35f70408287264318a178a3d58afca7636b3fbdde5713de11a5b834e95efea",
       "size": 1115000,
-      "shipped_reference_sha256": "bb67d12f41dc0b3f5dd944e499ff026d06fae806b7fb2cc45c947ca6745d0ba2",
       "sources": {
         "src/fold/qwen_fold_ops.cu": "709784539f2914830f71acf5124999f823c66774d7e1b43ad46c2ffb0388886b"
       }
@@ -106,9 +101,8 @@
         "MtpMoe"
       ],
       "built": true,
-      "sha256": "2cf8aaa6cb00615bdced03370b48db5b48ae5cf157b722f0f929bba79d2efcaa",
+      "sha256": "376f0e7c58e258c5e9785e9808a0c32db11815a1fbf8d8ad3235ba0abbe9fded",
       "size": 1289376,
-      "shipped_reference_sha256": "8e7f0105b476a878d63445ec26f68078cac811b260727a8a02b950853e41bf59",
       "sources": {
         "src/mtp_head/qwen_mtp_ops.cu": "c90ba180b9bd147e5972188f5462063eab6103ab8246c40375e0d71b69f30c62"
       }
@@ -119,12 +113,11 @@
         "GuardedDSA"
       ],
       "built": true,
-      "sha256": "b43e9a9d5827700b9b086b9a12a47015dad9f898337cd13a01d29e017ae5c19c",
+      "sha256": "e8d811d7d98d66881d2b88844921f5c163febc871d60ee229d4dfca82b089b96",
       "size": 4381288,
-      "shipped_reference_sha256": "02354458f5e734f01586792ad7ea7b49ddcb906d62ecf695bb1cc3538af76ec3",
       "sources": {
         "forks/guarded_dsa_r2/capture_ops_r2.cu": "d3e0904d54e2f31aaf078910af684736b0b7ede403a82305330796fd504d3449",
-        "forks/guarded_dsa_r2/guarded_dsa_r2.cu": "d298f67ef4304b47f69afdd43955618b2501369a8c83a40efc53fbdffdf75861",
+        "forks/guarded_dsa_r2/guarded_dsa_r2.cu": "90521f05416cd9832c3478906c97a3a11d74310a0ea754545a356195c796f611",
         "forks/guarded_dsa_r2/private_dsa.h": "19737e760462f4d3d1c0812d31b93a0ea0235438ab27c7bf5ee935b8a6ac355a",
         "forks/guarded_dsa_r2/cuda_runtime_status.cc": "0c3db9a00e881f0ac36916f096b1b66731c4243b1834aca3cbb57b0fbb854559",
         "forks/guarded_dsa_r2/guarded.exports": "8b3185e3ffeb3583d0ee8da282fb6f69f4a5d5fb9923ba5a448be3cd04126984"
@@ -136,13 +129,12 @@
         "PackedQSAIndexer"
       ],
       "built": true,
-      "sha256": "051a838290522545b654e9c423a40c51d3ebf71c19b62ae49e9af2bc355a9974",
-      "size": 4352288,
-      "shipped_reference_sha256": "6be5e06bcf5e00c627ae321cbed2ff7236123febd649ef7cbf55b910cb1fea8d",
+      "sha256": "0559208b2f12f46a2bea9507a620b74382dc079fe6f2af5d80820ed3a2c95d00",
+      "size": 4354360,
       "sources": {
-        "forks/packed_qsa_v11/packed_qsa_op_v11.cu": "485c126c494a23d6284f6377d0866a0f5c3b30d86b7e9fbe8b02ab4c1e59c339",
-        "forks/packed_qsa_v11/packed_sparse_attention_indexer_impl.cu": "fc5776f292055a8d548d6315f1354f45b984e18db661927688b7b362af95c9a6",
-        "forks/packed_qsa_v11/packed_sparse_attention_indexer_impl.h": "603379a39b37566ad760349654697061085c506bf8295a740b1f719c6b5ffdf9",
+        "forks/packed_qsa_v11/packed_qsa_op_v11.cu": "707a5c97cc5adca9e9505e5aa662dc115c15f3f654ae1e6556612f71da311a7b",
+        "forks/packed_qsa_v11/packed_sparse_attention_indexer_impl.cu": "37e782db3fc76b1e0de5c149372339b6ab3ce6a739c37766a584f97b080f6af1",
+        "forks/packed_qsa_v11/packed_sparse_attention_indexer_impl.h": "986b7d4380a06bade38aede6116d57aa54857d3bc9950c46190d89ff9533fe4d",
         "forks/packed_qsa_v11/packed_sparse_attention_indexer_common.h": "186f0ce74d8b0dc42f084d643c491986c8ce9dcb2ae1c47593b079a4da8362cb",
         "forks/packed_qsa_v11/sparse_attention_indexer_common.h": "c81d56bd44cf2b27946b4f614134dfff951f5684a9fe64330d003d83961651e4",
         "forks/packed_qsa_v11/sparse_attention_indexer_device_math.cuh": "69bc903ae84e66dbab0b15a74641d97e7f6df5de4e3d478efd719858e71fe8fe",

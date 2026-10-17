@@ -445,9 +445,9 @@ __device__ __forceinline__ void DnPhase(DnSm<NR, kFp8>& sm, const bf16* __restri
 #pragma unroll
   for (int q = 0; q < NR; ++q) inv_rms[q] = inv_rms_s[q];
   if constexpr (kMerged) {
-    if (j == 0 && h0 == 0 && tid < NR) StoreTagged(tab + (r0 + tid) * kTabRow + kTabInv + c, inv_rms[tid], sm.tag);
+    if (j == 0 && h0 == 0 && tid < NR) StoreTagged(tab + (r0 + tid) * kTabRow + kTabInv + c, inv_rms_s[tid], sm.tag);
   } else if (j == 0 && h0 == 0 && tid < 8 * NR) {
-    scratch[(r0 + tid / 8) * kScratchStride + kInvOff + c * 8 + (tid & 7)] = (tid & 7) == 0 ? inv_rms[tid / 8] : 0.0f;
+    scratch[(r0 + tid / 8) * kScratchStride + kInvOff + c * 8 + (tid & 7)] = (tid & 7) == 0 ? inv_rms_s[tid / 8] : 0.0f;
   } else if (j == 0 && s == 0 && tid >= 64 && tid < 64 + 8 * NR) {
     scratch[(r0 + (tid - 64) / 8) * kScratchStride + kAlphaOff + (tid & 7)] = (tid & 7) == 0 ? silu_alpha : 0.0f;
   }
