@@ -566,8 +566,7 @@ cudaError_t LaunchKernelW(const cudaLaunchConfig_t& cfg, const Params& p) {
 template <int M, int TX, int THREADS, int C, int U, bool FUSE = false>
 cudaError_t LaunchT(Params p, cudaStream_t stream) {
   constexpr int NCOL = TX * 8;
-  constexpr size_t kSmemLimit = FUSE ? (44 * 1024) : (40 * 1024);
-  if constexpr ((THREADS / 32) * M * NCOL * 4 + (FUSE ? M * kFuseMaxK * 4 : 0) > kSmemLimit) {
+  if constexpr ((THREADS / 32) * M * NCOL * 4 + (FUSE ? M * kFuseMaxK * 4 : 0) > 40 * 1024) {
     return cudaErrorInvalidValue;
   } else {
   int tiles = 0;
@@ -654,7 +653,10 @@ inline cudaError_t LaunchRows(int m, const Params& p, const Config& cfg, cudaStr
 // The reduction order of a row only depends on the config (never on the number of rows), so a row block
 // that does not fit the static shared memory of a config can be split into smaller row blocks with
 // bit-identical results (the weights are then streamed once per block).
-inline bool RowsFit(int m, const Config& cfg) { return (cfg.threads / 32) * m * cfg.tx * 8 * 4 <= 40 * 1024; }
+inline bool RowsFit(int m, const Config& cfg) {
+  const int smem = (cfg.threads / 32) * m * cfg.tx * 8 * 4;
+  return smem <= (cfg.cluster > 1 ? 24 * 1024 : 40 * 1024);
+}
 
 inline cudaError_t Launch(int m, const Params& p, const Config& cfg, cudaStream_t s) {
   if (m < 1) return cudaErrorInvalidValue;

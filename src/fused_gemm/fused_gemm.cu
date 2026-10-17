@@ -382,8 +382,8 @@ struct SharedExpertDownKernelState {
       p.gk = static_cast<int>(gk);
       skinny::Config cfg;
       if (p.w_mode[0] == 1) {
-        cfg.tx = 16;
-        cfg.cluster = 4;
+        cfg.tx = 8;
+        cfg.cluster = 1;
         cfg.threads = 512;
       } else {
         cfg.tx = 4;

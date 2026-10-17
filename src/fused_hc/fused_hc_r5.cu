@@ -609,64 +609,60 @@ __device__ __forceinline__ void UpBody(UpSm<NR, kFp8>& sm, int hb, const bf16* _
     const bool need2 = tid < kDown - kThreads;
     const bool needg = hb == 0 && tid < kGate && gate_out != nullptr;
     const bool needi = tid < NR * kUpSlice;
-    float p[NR][kSplit], p2[NR][kSplit], lg[NR][kSplit];
-    for (;;) {
-      unsigned long long u[NR][kSplit], u2[NR][kSplit], ug[NR][kSplit], ui[kBranches];
-#pragma unroll
-      for (int q = 0; q < NR; ++q) {
-        const unsigned long long* row = tab + (r0 + q) * kTabRow;
-#pragma unroll
-        for (int t = 0; t < kSplit; ++t) u[q][t] = LdSlot(row + t * (kDown + 8) + tid);
-        if (need2) {
-#pragma unroll
-          for (int t = 0; t < kSplit; ++t) u2[q][t] = LdSlot(row + t * (kDown + 8) + kThreads + tid);
-        }
-        if (needg) {
-#pragma unroll
-          for (int t = 0; t < kSplit; ++t) ug[q][t] = LdSlot(row + t * (kDown + 8) + kDown + tid);
-        }
-      }
-      if (needi) {
+    if (needi) {
+      for (;;) {
+        unsigned long long ui[kBranches];
 #pragma unroll
         for (int b = 0; b < kBranches; ++b) ui[b] = LdSlot(tab + (r0 + orow) * kTabRow + kTabInv + b);
-      }
-      bool ok = true;
-#pragma unroll
-      for (int q = 0; q < NR; ++q) {
-#pragma unroll
-        for (int t = 0; t < kSplit; ++t) {
-          p[q][t] = __uint_as_float(static_cast<unsigned>(u[q][t]));
-          ok = ok && static_cast<unsigned>(u[q][t] >> 32) == tag;
-        }
-        if (need2) {
-#pragma unroll
-          for (int t = 0; t < kSplit; ++t) {
-            p2[q][t] = __uint_as_float(static_cast<unsigned>(u2[q][t]));
-            ok = ok && static_cast<unsigned>(u2[q][t] >> 32) == tag;
-          }
-        }
-        if (needg) {
-#pragma unroll
-          for (int t = 0; t < kSplit; ++t) {
-            lg[q][t] = __uint_as_float(static_cast<unsigned>(ug[q][t]));
-            ok = ok && static_cast<unsigned>(ug[q][t] >> 32) == tag;
-          }
-        }
-      }
-      if (needi) {
+        bool ok_i = true;
 #pragma unroll
         for (int b = 0; b < kBranches; ++b) {
           inv[b] = __uint_as_float(static_cast<unsigned>(ui[b]));
-          ok = ok && static_cast<unsigned>(ui[b] >> 32) == tag;
+          ok_i = ok_i && static_cast<unsigned>(ui[b] >> 32) == tag;
         }
+        if (ok_i) break;
       }
-      if (ok) break;
     }
-#pragma unroll
     for (int q = 0; q < NR; ++q) {
+      const unsigned long long* row = tab + (r0 + q) * kTabRow;
+      float p[kSplit], p2[kSplit], lg[kSplit];
+      for (;;) {
+        unsigned long long u[kSplit], u2[kSplit], ug[kSplit];
+#pragma unroll
+        for (int t = 0; t < kSplit; ++t) u[t] = LdSlot(row + t * (kDown + 8) + tid);
+        if (need2) {
+#pragma unroll
+          for (int t = 0; t < kSplit; ++t) u2[t] = LdSlot(row + t * (kDown + 8) + kThreads + tid);
+        }
+        if (needg) {
+#pragma unroll
+          for (int t = 0; t < kSplit; ++t) ug[t] = LdSlot(row + t * (kDown + 8) + kDown + tid);
+        }
+        bool ok = true;
+#pragma unroll
+        for (int t = 0; t < kSplit; ++t) {
+          p[t] = __uint_as_float(static_cast<unsigned>(u[t]));
+          ok = ok && static_cast<unsigned>(u[t] >> 32) == tag;
+        }
+        if (need2) {
+#pragma unroll
+          for (int t = 0; t < kSplit; ++t) {
+            p2[t] = __uint_as_float(static_cast<unsigned>(u2[t]));
+            ok = ok && static_cast<unsigned>(u2[t] >> 32) == tag;
+          }
+        }
+        if (needg) {
+#pragma unroll
+          for (int t = 0; t < kSplit; ++t) {
+            lg[t] = __uint_as_float(static_cast<unsigned>(ug[t]));
+            ok = ok && static_cast<unsigned>(ug[t] >> 32) == tag;
+          }
+        }
+        if (ok) break;
+      }
       float v = 0.0f;
 #pragma unroll
-      for (int t = 0; t < kSplit; ++t) v += p[q][t];
+      for (int t = 0; t < kSplit; ++t) v += p[t];
       {
         const float z = R(R(v) * silu_alpha);
         sf[q][tid] = R(z * R(SigmoidSilu(z)));
@@ -675,7 +671,7 @@ __device__ __forceinline__ void UpBody(UpSm<NR, kFp8>& sm, int hb, const bf16* _
       if (need2) {
         float v2 = 0.0f;
 #pragma unroll
-        for (int t = 0; t < kSplit; ++t) v2 += p2[q][t];
+        for (int t = 0; t < kSplit; ++t) v2 += p2[t];
         const float z = R(R(v2) * silu_alpha);
         sf[q][tid + kThreads] = R(z * R(SigmoidSilu(z)));
         if (final_out && hb == 0) scratch[(r0 + q) * kScratchStride + tid + kThreads] = sf[q][tid + kThreads];
@@ -688,7 +684,7 @@ __device__ __forceinline__ void UpBody(UpSm<NR, kFp8>& sm, int hb, const bf16* _
       if (needg) {
         float l = 0.0f;
 #pragma unroll
-        for (int t = 0; t < kSplit; ++t) l += lg[q][t];
+        for (int t = 0; t < kSplit; ++t) l += lg[t];
         l = R(l);
         if (final_out) scratch[(r0 + q) * kScratchStride + kDown + tid] = l;
         const float t = R(l / gate_div);
