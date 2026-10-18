@@ -29,11 +29,14 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 # The shipped libraries were built with plain `nvcc -O3` (no -DNDEBUG): keep the flags identical.
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+if(NOT MSVC)
+  set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+endif()
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
 # One shared library per domain; the output name is lib<NAME>.so, identical to the file name the model packages load.
 function(qwen38_add_op_library NAME ARCH_SUFFIX)
@@ -46,6 +49,10 @@ function(qwen38_add_op_library NAME ARCH_SUFFIX)
     set(_arch_flags "-gencode arch=compute_${QWEN38_CUDA_ARCH}${ARCH_SUFFIX},code=sm_${QWEN38_CUDA_ARCH}${ARCH_SUFFIX}")
   endif()
   target_compile_options(${NAME} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:${_arch_flags}>")
+  if(MSVC)
+    target_compile_options(${NAME} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/wd4244,/wd4267,/wd4996>")
+    target_link_options(${NAME} PRIVATE "LINKER:/EXPORT:RegisterCustomOps")
+  endif()
   set_target_properties(${NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
   list(APPEND QWEN38_OP_LIBRARIES ${NAME})
   set(QWEN38_OP_LIBRARIES ${QWEN38_OP_LIBRARIES} PARENT_SCOPE)
@@ -55,8 +62,8 @@ find_package(CUDAToolkit REQUIRED)
 
 qwen38_add_op_library(qwen_fused_ops    ""  src/fused_ops/fused_ops.cu)             # domain qwen.fused
 qwen38_add_op_library(qwen_fused_attn_r5 a  src/fused_attn/fused_attn_r5.cu)        # domain qwen.fused_attn
-qwen38_add_op_library(qwen_fused_hc_r5  ""  src/fused_hc/fused_hc_r5.cu)            # domain qwen.fused_hc
-qwen38_add_op_library(qwen_fused_gemm_r5 "" src/fused_gemm/fused_gemm.cu)           # domain qwen.fused_gemm
+qwen38_add_op_library(qwen_fused_hc_r5   a  src/fused_hc/fused_hc_r5.cu)            # domain qwen.fused_hc
+qwen38_add_op_library(qwen_fused_gemm_r5 a  src/fused_gemm/fused_gemm.cu)           # domain qwen.fused_gemm
 target_include_directories(qwen_fused_gemm_r5 PRIVATE src/fused_gemm)
 target_link_libraries(qwen_fused_gemm_r5 PRIVATE CUDA::cublas)
 qwen38_add_op_library(qwen_fold         ""  src/fold/qwen_fold_ops.cu)              # domain qwen.fold

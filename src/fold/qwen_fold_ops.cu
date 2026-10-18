@@ -34,7 +34,7 @@ namespace {
 typedef long long i64;
 constexpr i64 kHeadCapacity = 33028;
 
-void CheckLaunch() {
+void CheckLaunch(const char* = "") {
   cudaError_t error = cudaGetLastError();
   if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -184,7 +184,8 @@ __global__ void EmbedNormKernel(const i64* ids, const unsigned short* table, con
       }
     }
   }
-  const i64 tok = ids[blockIdx.x];
+  const i64 raw_tok = ids[blockIdx.x];
+  const i64 tok = (raw_tok >= 0 && raw_tok < 248320) ? raw_tok : 0;
   const unsigned short* row = table + tok * n;
   float acc = 0.f;
   for (int k = threadIdx.x; k < n; k += 512) {
@@ -345,6 +346,7 @@ struct Mid2State {
       auto sin_out = c.GetOutput(5, std::vector<int64_t>{1, head_rows, 32});
       auto sel = c.GetOutput(6, std::vector<int64_t>{1});
       cudaStream_t stream = Stream(api, raw);
+      CheckLaunch("before FoldMid2");
       FoldMid2Kernel<<<1, static_cast<unsigned>(32 * (head_rows + 1)), 0, stream>>>(
           tok.GetTensorData<i64>(), ids.GetTensorData<i64>(), status.GetTensorData<int>(), nst,
           const_cast<i64*>(ctl.GetTensorData<i64>()), const_cast<i64*>(ctx_commit.GetTensorData<i64>()),
@@ -355,6 +357,7 @@ struct Mid2State {
           seqlens.GetTensorMutableData<int>(), reinterpret_cast<unsigned short*>(cos_out.GetTensorMutableData<Ort::BFloat16_t>()),
           reinterpret_cast<unsigned short*>(sin_out.GetTensorMutableData<Ort::BFloat16_t>()), sel.GetTensorMutableData<i64>(),
           static_cast<int>(rows), static_cast<int>(head_rows));
+      CheckLaunch("after FoldMid2Kernel");
       if (c.GetInputCount() > 10 && c.GetOutputCount() > 7) {
         const OrtValue* v_in = nullptr;
         Ort::ThrowOnError(api.KernelContext_GetInput(raw, 10, &v_in));
@@ -382,7 +385,7 @@ struct Mid2State {
           }
         }
       }
-      CheckLaunch();
+      CheckLaunch("after FoldMid2");
       return nullptr;
     } catch (const std::exception& e) {
       return api.CreateStatus(ORT_FAIL, e.what());
@@ -435,11 +438,12 @@ struct EmbedNormState {
       slot_ids_ptr = static_cast<i64*>(opt_out(1, {1, rows}));
       seqlens_k_ptr = static_cast<int*>(opt_out(2, {1}));
       cu_seqlens_ptr = static_cast<int*>(opt_out(3, {2}));
+      CheckLaunch("before EmbedNorm");
       EmbedNormKernel<<<rows, 512, 0, Stream(api, raw)>>>(
           ids.GetTensorData<i64>(), reinterpret_cast<const unsigned short*>(table.GetTensorData<Ort::BFloat16_t>()),
           w.GetTensorData<float>(), eps, reinterpret_cast<unsigned short*>(out.GetTensorMutableData<Ort::BFloat16_t>()), n,
           committed_ptr, slot_ids_ptr, seqlens_k_ptr, cu_seqlens_ptr, rows);
-      CheckLaunch();
+      CheckLaunch("after EmbedNorm");
       return nullptr;
     } catch (const std::exception& e) {
       return api.CreateStatus(ORT_FAIL, e.what());
@@ -472,12 +476,13 @@ struct RowSelectState {
         y[i] = out.GetTensorMutableData<Ort::BFloat16_t>();
         n16[i] = static_cast<int>(row_elems);
       }
+      CheckLaunch("before RowSelect");
       RowSelectKernel<<<dim3(8, 3), 256, 0, Stream(api, raw)>>>(
           sel.GetTensorData<i64>(), reinterpret_cast<const unsigned short*>(x[0]),
           reinterpret_cast<const unsigned short*>(x[1]), reinterpret_cast<const unsigned short*>(x[2]),
           reinterpret_cast<unsigned short*>(y[0]), reinterpret_cast<unsigned short*>(y[1]),
           reinterpret_cast<unsigned short*>(y[2]), n16[0], n16[1], n16[2], rows);
-      CheckLaunch();
+      CheckLaunch("after RowSelect");
       return nullptr;
     } catch (const std::exception& e) {
       return api.CreateStatus(ORT_FAIL, e.what());
@@ -531,6 +536,7 @@ struct DraftPrepState {
       auto sin_out = c.GetOutput(5, std::vector<int64_t>{1, 1, 32});
       auto out_buf = c.GetOutput(6, std::vector<int64_t>{1, 7, 128});
       auto out_len = c.GetOutput(7, std::vector<int64_t>{1, 2});
+      CheckLaunch("before FoldDraftPrep");
       FoldDraftPrepKernel<<<1, 256, 0, Stream(api, raw)>>>(
           tok.GetTensorData<i64>(), const_cast<i64*>(ctl.GetTensorData<i64>()), sel.GetTensorData<i64>(),
           reinterpret_cast<const unsigned short*>(cos_cache.GetTensorData<Ort::BFloat16_t>()),
@@ -542,7 +548,7 @@ struct DraftPrepState {
           reinterpret_cast<unsigned short*>(sin_out.GetTensorMutableData<Ort::BFloat16_t>()),
           reinterpret_cast<unsigned short*>(out_buf.GetTensorMutableData<Ort::BFloat16_t>()),
           out_len.GetTensorMutableData<int>());
-      CheckLaunch();
+      CheckLaunch("after FoldDraftPrep");
       return nullptr;
     } catch (const std::exception& e) {
       return api.CreateStatus(ORT_FAIL, e.what());

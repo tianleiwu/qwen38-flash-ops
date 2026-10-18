@@ -189,7 +189,7 @@ __global__ void __launch_bounds__(kArgMaxFinalThreads)
     best = sv[0];
     best_i = si[0];
     for (int w = 1; w < kArgMaxFinalThreads / 32; ++w) MergeBest(best, best_i, sv[w], si[w]);
-    out[blockIdx.x] = best_i;
+    out[blockIdx.x] = (best_i == 0x7fffffff) ? 0 : best_i;
   }
 }
 
@@ -243,6 +243,10 @@ __global__ void RouterKernel(const bf16* __restrict__ logits, float* __restrict_
         best_i = oi;
       }
     }
+    if (best_i < 0 || best_i >= kExperts) {
+      best = 0.0f;
+      best_i = k;
+    }
     top_v[k] = best;
     top_i[k] = best_i;
     // remove the winner from its owner lane
@@ -259,7 +263,7 @@ __global__ void RouterKernel(const bf16* __restrict__ logits, float* __restrict_
 #pragma unroll
     for (int k = 0; k < kTopK; ++k) {
       out[k] = __int_as_float(top_i[k]);
-      out[kTopK + k] = R(top_v[k] / total);
+      out[kTopK + k] = (total > 0.0f) ? R(top_v[k] / total) : 0.0f;
     }
   }
 }
